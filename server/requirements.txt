@@ -1,0 +1,10 @@
+# Python 3.11 venv (versions as used on the reference machine).
+# Install torch and exllamav3 first, see README:
+#   torch==2.10.0+cu128           (https://download.pytorch.org/whl/cu128)
+#   exllamav3==1.5.1 prebuilt wheel exllamav3-1.5.1+cu128.torch2.10.0-cp311-cp311-win_amd64.whl
+#   (https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.1)
+fastapi==0.141.1
+uvicorn==0.53.0
+transformers==5.17.0
+tokenizers==0.23.2
+pillow==12.3.0

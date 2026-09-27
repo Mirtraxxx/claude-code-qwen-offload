@@ -1,0 +1,23 @@
+# Optional: ~/.omp/agent/config.yml (Windows: %USERPROFILE%\.omp\agent\config.yml).
+# Makes the local 27B the model for every omp role, so omp never reaches for a cloud model.
+defaultThinkingLevel: medium
+modelRoles:
+  default: llamacpp/qwen3.8-27b:medium
+  smol: llamacpp/qwen3.8-27b:low
+  slow: llamacpp/qwen3.8-27b:high
+  task: llamacpp/qwen3.8-27b:medium
+  vision: llamacpp/qwen3.8-27b:medium
+  plan: llamacpp/qwen3.8-27b:medium
+  commit: llamacpp/qwen3.8-27b:low
+  tiny: llamacpp/qwen3.8-27b:minimal
+  advisor: llamacpp/qwen3.8-27b:medium
+
+# Disable omp's multi-agent fan-out (bundled task agents): with one local GPU they only compete
+# for the same server slots. Remove this block to restore subagent delegation.
+task:
+  disabledAgents:
+    - scout
+    - reviewer
+    - security-reviewer
+    - task
+    - sonic

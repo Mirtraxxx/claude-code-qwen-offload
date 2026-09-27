@@ -1,0 +1,33 @@
+# oh-my-pi (omp) provider entry for the local exllamav3 server.
+# Merge this into ~/.omp/agent/models.yml (Windows: %USERPROFILE%\.omp\agent\models.yml).
+# Tested with omp 18.2.11. The provider is named "llamacpp" because the server speaks the same
+# OpenAI-compatible dialect as llama-server; the model is then addressed as llamacpp/qwen3.8-27b.
+# No API key: the server has no auth (keep it bound to 127.0.0.1).
+providers:
+  llamacpp:
+    baseUrl: http://127.0.0.1:8080/v1
+    api: openai-completions
+    auth: none
+    compat:
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      thinkingFormat: qwen
+      reasoningEffortMap:
+        minimal: low
+        low: low
+        medium: medium
+        high: xhigh
+        xhigh: xhigh
+        max: xhigh
+    models:
+      - id: "qwen3.8-27b"
+        name: "Swift Qwen 3.8 27B Uncensored (EXL3 3.75bpw)"
+        reasoning: true
+        input: [text, image]
+        contextWindow: 131072
+        maxTokens: 16384
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0

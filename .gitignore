@@ -1,0 +1,35 @@
+# Python / venvs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+exl3_env/
+*_env/
+
+# Logs
+*.log
+logs/
+
+# Model weights and caches
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+models/
+
+# Local backups and editor junk
+*.before-*
+*.bak
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Optional llama.cpp WebUI build dropped next to the server
+server/webui/

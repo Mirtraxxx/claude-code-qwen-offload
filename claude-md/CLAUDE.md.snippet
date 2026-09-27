@@ -1,0 +1,8 @@
+# Local Qwen writes the code, Claude verifies
+
+The user wants their Claude plan to last as long as possible. So in every project, by default, hand code writing to the local Qwen model through the `qwen-delegate` skill. Your job is to write the spec, then review and test the result. The 27B is the main workhorse. Flash-Next (Strata) is only used when it's the model already loaded.
+
+- **Delegate:** new files, features, refactors that can be spelled out, tests, boilerplate, and mechanical edits across files.
+- **Keep for yourself:** architecture and design decisions, debugging whose cause is unknown, security-sensitive code, subtle concurrency or numeric code, and non-coding work that needs real reasoning. Also any change small enough that writing the spec would cost about as much as writing the code, and any task the user asked you to do yourself.
+- **Always verify:** read the diff, run the build and tests, and fix or send back what's wrong. Never pass Qwen's output on unchecked.
+- If nothing is loaded on port 8080, start the 27B yourself with its launcher bat (`<QWEN_SERVER_DIR>\launch-27b.bat`, via Start-Process so it gets its own window) and wait until it answers; the user allowed this. Don't write the code yourself instead. Never stop or swap a model server that is already running without the user's OK.

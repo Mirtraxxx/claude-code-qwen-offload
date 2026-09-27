@@ -1,0 +1,19 @@
+exllamav3 1.5.1 (wheel exllamav3-1.5.1+cu128.torch2.10.0) - DFlash2 batching fix.
+Without this, two overlapping requests on the DFlash2 path both crash with a
+'.view()' error on a non-contiguous slice. Adds .contiguous() to the state and
+logits slices passed to walk_block.
+Apply from the env's site-packages folder:  git apply <path>/dflash2-contiguous.patch
+
+diff --git a/exllamav3/architecture/dflash2.py b/exllamav3/architecture/dflash2.py
+index b4df8bd..8d897c1 100644
+--- a/exllamav3/architecture/dflash2.py
++++ b/exllamav3/architecture/dflash2.py
+@@ -282,7 +282,7 @@ class DFlash2Model(Model):
+         # (draft's last block) and the logits (target's head) may sit on other devices than
+         # the selector: to_device bounces pairs with a broken peer path through the host
+         out, confidence = self.selector.walk_block(
+-            to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
++            to_device(state[:, 1:].contiguous(), dev), to_device(logits[:, 1:].contiguous(), dev), anchor,
+             return_confidence = export_conf,
+             vocab_size = target.config.vocab_size,
+             scale = self.config.output_multiplier,
