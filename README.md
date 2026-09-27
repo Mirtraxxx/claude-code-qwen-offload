@@ -31,6 +31,22 @@ What's in here:
   with exllamav3's converter.
 - 131k context with a 4-bit KV cache fits alongside two concurrent requests.
 
+### How the model was made
+
+The full recipe is on the [model card](https://huggingface.co/tiktits/Swift-1.5-Qwen3.8-27B-Uncensored-EXL3-3.75bpw). In short:
+
+- **Base:** UkisAI's Swift 1.5, a Qwen3.8-27B fine-tune (GSPO reinforcement learning plus on-policy distillation)
+  that uses about 58% fewer reasoning tokens and ends its thinking on its own, so no reasoning budget is needed.
+- **Uncensoring:** refusal-direction abliteration (Arditi et al., 2024). A layer-38 refusal direction taken from 400
+  AdvBench vs 400 Alpaca prompts is projected out (rank-1, float32) of 131 residual-writing tensors before
+  quantization, using tools from `ajgazin/Swift-Qwen3.8-27B-Uncensored-MTP` and `orcarouter/Qwen3.8-27B-Uncensored`.
+- **EXL3 quant** (`SC_3.75bpw_H5_V6_MTP4`): 3.75 bpw backbone, 5.0 bpw LM head, 6.0 bpw vision tower, 4.0 bpw MTP
+  head, BF16 embeddings kept on the CPU; 14.52 GiB total.
+- **Sampling** (from the card): coding at temperature 0.6, top_p 0.95, top_k 20, presence_penalty 1.5; reasoning at
+  temperature 1.0, top_p 0.95, top_k 20.
+- **Model license:** Swift Open License v1.0 (personal, research and educational use, and commercial use under $1M
+  yearly revenue); base Qwen3.8-27B is Apache 2.0. This repo's own files are public domain (see `LICENSE`).
+
 The author also runs a Swift 1.5 Flash-Next 180B MoE through a separate engine (Strata). That setup
 isn't included here; the skill still mentions it as an optional second model and works fine
 without it.
