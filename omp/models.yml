@@ -1,5 +1,6 @@
 # oh-my-pi (omp) provider entry for the local exllamav3 server.
 # Merge this into ~/.omp/agent/models.yml (Windows: %USERPROFILE%\.omp\agent\models.yml).
+# If PI_CODING_AGENT_DIR is set, omp reads its config from that folder instead.
 # Tested with omp 18.2.11. The provider is named "llamacpp" because the server speaks the same
 # OpenAI-compatible dialect as llama-server; the model is then addressed as llamacpp/qwen3.8-27b.
 # No API key: the server has no auth (keep it bound to 127.0.0.1).
@@ -12,6 +13,9 @@ providers:
       supportsDeveloperRole: false
       supportsReasoningEffort: true
       thinkingFormat: qwen
+      # Required: with thinkingFormat qwen and without this flag, omp sends no reasoning_effort at all,
+      # so --thinking low silently runs at the server's default (xhigh, unlimited thinking).
+      qwenTemplateReasoningEffort: true
       reasoningEffortMap:
         minimal: low
         low: low

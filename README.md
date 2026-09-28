@@ -11,8 +11,9 @@ What's in here:
 | Path | What it is |
 |---|---|
 | `skill/qwen-delegate/SKILL.md` | Claude Code skill: when and how to delegate to Qwen, and how to verify the result |
+| `skill/qwen-delegate/qwen-run.mjs` | Wrapper that runs one coding job: adds house rules to the brief, diffs the result, flags problems, logs the ledger |
 | `claude-md/CLAUDE.md.snippet` | Policy section for `~/.claude/CLAUDE.md` that makes delegation the default |
-| `server/exl3_openai_server.py` | OpenAI-compatible FastAPI server on exllamav3, with DFlash2 speculative decoding and request batching |
+| `server/exl3_openai_server.py` | OpenAI-compatible FastAPI server on exllamav3, with DFlash2 speculative decoding, request batching, thinking caps and a live worker board |
 | `server/launch-27b.bat` | Windows launcher for the 27B with the recommended settings (`-ambs 2`) |
 | `server/requirements.txt` | Python deps for the server (versions from the reference machine) |
 | `patches/dflash2-contiguous.patch` | exllamav3 1.5.1 fix needed for batching with DFlash2 |
@@ -96,6 +97,21 @@ Key flags: `-ambs 2` (two concurrent requests, the throughput sweet spot), `-cs 
 `qwen3.8-27b`. The server serves the llama.cpp web UI at `/` if you drop its static build into
 `server/webui/` (optional).
 
+What the server adds on top of plain exllamav3 (all on by default):
+
+- **Thinking caps per effort** (`--effort-budgets low=4096,medium=8192`): a request that asks for
+  `low` or `medium` effort without its own thinking budget gets capped there. `high` maps to
+  uncapped `xhigh`.
+- **Short prompt chunks** (`--max-chunk-size 512`): while one request reads a long prompt, the
+  other keeps generating instead of stalling to ~3 tok/s.
+- **Worker board:** while 2+ requests overlap, the console prints one line every 3 s with each
+  worker's state (queued, reading prompt, writing, or tools/idle), its speed and tokens so far, and
+  the total. A "worker" is one client conversation, keyed by its first user message.
+- **Disconnect abort:** a job stops within about a second when its client goes away (uvicorn
+  otherwise keeps generating for a dead connection).
+- **`requests.log`** next to the script: one line per request with worker, effort, thinking
+  budget, prompt/cached/output tokens, finish reason, and `THINK-CAP-HIT` or `ABORTED`.
+
 The server has **no authentication** and will fetch image URLs or read local image paths sent in
 requests, so it binds to `127.0.0.1` by default. Only set `HOST=0.0.0.0` on a network you trust.
 
@@ -112,7 +128,17 @@ see its README for other options). Tested with **omp 18.2.11**.
 
 Merge `omp/models.yml` into `%USERPROFILE%\.omp\agent\models.yml`. Optionally copy
 `omp/config.yml` to `%USERPROFILE%\.omp\agent\config.yml` so every omp role uses the local model
-and omp's own subagent fan-out is off. The reference machine also points omp's shell at Git Bash in
+and omp's own subagent fan-out is off. (If `PI_CODING_AGENT_DIR` is set, omp uses that folder
+instead of `%USERPROFILE%\.omp\agent`.) Two settings matter even if you skip the rest:
+
+- `qwenTemplateReasoningEffort: true` in the provider's `compat` (already in `omp/models.yml`).
+  Without it omp sends no effort level at all, so `--thinking low` silently runs at the server's
+  default: xhigh, with unlimited thinking.
+- The `compaction` block in `omp/config.yml`. It keeps each worker under about 40k tokens so two
+  fit in the 131k cache, and it uses LLM-written handoffs instead of omp's default `snapcompact`,
+  which stores history as images the 27B can't read back.
+
+The reference machine also points omp's shell at Git Bash in
 `%USERPROFILE%\.omp\agent\settings.json`: `{ "shellPath": "C:\\Program Files\\Git\\bin\\bash.exe" }`.
 
 ### 5. Install the Claude Code skill and policy
@@ -122,26 +148,47 @@ Copy-Item -Recurse skill\qwen-delegate "$env:USERPROFILE\.claude\skills\"
 ```
 
 In the installed `SKILL.md`, replace `<QWEN_SERVER_DIR>` with the folder that holds the server and
-launcher (and delete the Flash-Next row if you don't run it). Then paste
+launcher, `<SKILL_DIR>` with the skill's folder, and `<OMP_CONFIG_DIR>` with omp's config folder
+(and delete the Flash-Next row if you don't run it). The wrapper needs Node 22+ and Git on PATH. Then paste
 `claude-md/CLAUDE.md.snippet` into `~/.claude/CLAUDE.md`, again replacing `<QWEN_SERVER_DIR>`.
 
 ## What a delegation looks like
 
-Claude runs something like this, with a complete brief (Qwen has none of the conversation's
-context: name the files, the goal and the expected output):
+Claude writes a complete brief to a file (Qwen has none of the conversation's context: name the
+files, the goal and the expected output) and runs the wrapper:
 
-```powershell
-omp -p --no-session --model llamacpp/qwen3.8-27b --thinking low --tools read,grep,glob,edit,write --cwd <project> "<brief>"
+```bash
+node qwen-run.mjs --cwd <project> --brief brief.md --task "add save slots" --files js/save.js,js/ui.js
 ```
 
-Then it reads the diff, runs the build and tests, and either accepts, fixes small things itself,
+The wrapper:
+
+- detects the loaded model;
+- prepends house rules to the brief: work incrementally, read at most 3 files per turn, use
+  `write` only for new files, touch only the listed files;
+- runs omp with stdin closed (`omp -p` otherwise hangs waiting for piped input);
+- snapshots the project before and after, and writes a diff to `%TEMP%\qwen-runs\`;
+- flags `EMPTY-ANSWER`, `TIMEOUT`, `EXIT-n`, `NO-CHANGES`, `OUT-OF-SCOPE:` and `MISSING:`;
+- appends a line to `<project>/qwen/ledger.csv` if that file exists.
+
+It exits 0 when clean and 1 when anything was flagged. Read-only jobs can call omp directly:
+
+```powershell
+omp -p --no-session --model llamacpp/qwen3.8-27b --thinking low --tools read,grep,glob --cwd <project> "<brief>"
+```
+
+Then Claude reads the diff, runs the build and tests, and either accepts, fixes small things itself,
 or reruns Qwen quoting the exact failure.
 
 ## Tips
 
 - **`--cwd` is required.** omp moves itself to a temp dir when started from the home folder.
-- **`--thinking low` for mechanical briefs.** At `medium` the model sometimes spends the whole
-  budget thinking and outputs nothing.
+- **`--thinking low` by default** (capped at 4,096 thinking tokens), `medium` (8,192) for tricky
+  logic. At uncapped `high`/xhigh the model can spend a whole 16k reply thinking and output nothing.
+- **Big jobs must write as they go.** A job whose working set is bigger than about 35k tokens
+  can't hold it all between compactions: brief it to finish and save each piece before reading
+  more. After one compaction, a worker used `write` to regenerate its own output file from memory
+  and silently dropped half its findings. That's why the house rules restrict `write` to new files.
 - **Tools:** `read,grep,glob,edit,write` for code-writing tasks (`edit` is find/replace);
   `read,grep,glob` for review and analysis. Never give it write access outside the project.
 - **Treat the output as an untrusted draft.** Always review the diff yourself (not Qwen's summary
@@ -162,6 +209,11 @@ Measured with `bench/conc.py` (`python conc.py <prose|code> 1 2 3`), 700-token r
 
 Real coding jobs run at about 130 tok/s single. Code is faster than prose, most likely because
 DFlash2's drafts get accepted more often on predictable text. A third slot fits in VRAM but lowers total throughput.
+
+**Two long agent jobs at once** (thinking low, with the compaction settings above): two 16-file
+read-and-write jobs both finished in 16–18 minutes, with 3 handoffs each and no truncated replies.
+Replies ran at 23–96 tok/s (median 43), lower than the benchmark because both workers keep
+re-reading long prompts and each handoff takes 1–3 minutes.
 
 ## Does it actually save Claude tokens?
 

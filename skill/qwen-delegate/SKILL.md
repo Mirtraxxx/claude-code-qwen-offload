@@ -6,8 +6,10 @@ description: Delegate a self-contained task to the user's local Qwen model (Swif
 # Delegate to local Qwen via omp
 
 <!-- Setup: replace <QWEN_SERVER_DIR> below with the folder that holds exl3_openai_server.py and
-     launch-27b.bat (the repo's server/ folder, or wherever you copied it). The Flash-Next row is
-     optional; its engine is not part of this repo, so delete it if you only run the 27B. -->
+     launch-27b.bat (the repo's server/ folder, or wherever you copied it), and <SKILL_DIR> with this
+     skill's folder (e.g. %USERPROFILE%\.claude\skills\qwen-delegate). <OMP_CONFIG_DIR> is
+     %USERPROFILE%\.omp\agent, or the folder in PI_CODING_AGENT_DIR if you set that. The Flash-Next
+     row is optional; its engine is not part of this repo, so delete it if you only run the 27B. -->
 
 The user's GPU holds ONE model at a time, always served at `http://127.0.0.1:8080/v1`:
 
@@ -37,6 +39,29 @@ The 27B launcher is `<QWEN_SERVER_DIR>\launch-27b.bat`.
 - The user's other Claude threads may be using the same model server. Requests queue: the 27B takes as many at once as its launcher's `-ambs` allows, Strata takes one.
 - 27B concurrency (measured 2026-09-27, thinking off): coding runs about 120 tok/s alone and about 180-200 tok/s total with 2 at once; prose about 52 alone and 88 total with 2. A third slot (`-ambs 3`) fits in VRAM but is slower in total (about 172 coding, 75 prose), so 2 is the sweet spot. Two Qwen tasks can run in parallel when they touch different files.
 - Batching needs a local patch in `exl3_env\Lib\site-packages\exllamav3\architecture\dflash2.py` (`.contiguous()` on the `state[:, 1:]` and `logits[:, 1:]` slices passed to `walk_block`); without it, any two overlapping requests both die. Reinstalling exllamav3 drops it (reapply `patches/dflash2-contiguous.patch`).
+- The server also patches Python 3.11's Windows accept loop (`_keep_accepting_on_windows` in `exl3_openai_server.py`). Without it, one client dropping a connection at the wrong moment closes port 8080 for good while the process keeps generating: omp then fails with "Unable to connect". If that symptom shows up, check the patch is still there.
+
+## Worker setup (tuned 2026-09-27; check it's still in place if workers misbehave)
+
+- omp reads its config from `<OMP_CONFIG_DIR>`. Change it with `omp config set <key> <value>` from bash (PowerShell strips the quotes from JSON arrays) and read it back with `omp config get <key>`.
+- The `llamacpp` provider in `models.yml` needs `compat: qwenTemplateReasoningEffort: true`. Without it omp sends no `reasoning_effort` at all, so `--thinking low` silently runs at the server's default xhigh with unlimited thinking.
+- Compaction (`config.yml`):
+  - `thresholdTokens: 40000`, so two workers fit the 128k pool with output room.
+  - `keepRecentTokens: 8000`. At the default of 20000, workers re-hit the threshold 2-3 turns after each compaction.
+  - `methodOrder: [handoff, soft, shake]`. The default `snapcompact` archives history as bitmap images of text that the 27B can't read back, so workers thrash: compact, re-read, compact.
+  - A handoff is an LLM call and takes 1-3 min at `low`.
+- The server (`exl3_openai_server.py`):
+  - `--effort-budgets low=4096,medium=8192` (the default) caps thinking per requested effort.
+  - `--max-chunk-size 512` (the default) keeps one worker's prompt reading from stalling the other to ~3 tok/s.
+  - While 2+ workers run, it shows a one-line-per-3 s concurrency board.
+  - It aborts a job when its client disconnects.
+  - It appends one line per request to `requests.log` next to the server script: worker, effort, thinking budget, prompt/cached/out tokens, finish reason, and `THINK-CAP-HIT` or `ABORTED`. Read this log to see what workers actually did.
+- Measured with these settings (two workers at once, 16-file read-and-write jobs): both finished in 16-18 min with 3 handoffs each. There were no truncated replies, and replies ran at 23-96 tok/s (median 43).
+- **Brief shape for anything bigger than a few files:**
+  - Tell Qwen to work incrementally: finish and save each piece before reading more.
+  - At most 3 file reads per turn.
+  - `write` only creates new files; changes to an existing file go through `edit`. After a compaction, a worker used `write` to regenerate its own output file from memory and silently dropped half its findings.
+  - A job whose working set is bigger than ~35k tokens can't hold it all and must write as it goes.
 
 ## 1. Detect the loaded model
 
@@ -49,6 +74,24 @@ else { "llamacpp/qwen3.8-27b" }
 
 ## 2. Run the task
 
+**Code-writing jobs: use the wrapper.** Write the brief to a file, then run:
+
+```bash
+node "<SKILL_DIR>/qwen-run.mjs" --cwd "<project dir>" --brief "<brief file>" --task "<ledger label>" --files a.js,b.css [--thinking medium] [--max-time 30m] [--reruns 1]
+```
+
+What the wrapper does:
+- Detects the model and prepends house rules to the brief: work incrementally, at most 3 reads per turn, `write` only for new files, touch only the listed files.
+- Snapshots the project, runs omp with stdin closed (otherwise `omp -p` hangs waiting for piped input), and diffs the result into `%TEMP%\qwen-runs\<time>-<task>.diff`.
+- Flags `EMPTY-ANSWER`, `TIMEOUT`, `EXIT-n`, `NO-CHANGES`, `OUT-OF-SCOPE:` and `MISSING:`.
+- Appends the ledger line to `<cwd>/qwen/ledger.csv` when that file exists.
+- Exit codes: 0 clean, 1 flags, 2 bad args, 3 no server, 4 omp missing.
+- Use `--dry-run` to see the command, and `--no-ledger` for throwaway runs.
+
+Then verify the diff file yourself (step 3). The flags are a first filter, not the review. Anything longer than about 2 minutes goes in `run_in_background`.
+
+Read-only jobs (review, summary) can call omp directly:
+
 ```powershell
 omp -p --no-session --model <omp model id> --thinking <low|medium|high> --tools read,grep,glob --cwd "<project dir>" --max-time 10m "<task prompt>"
 ```
@@ -59,7 +102,7 @@ omp -p --no-session --model <omp model id> --thinking <low|medium|high> --tools 
 - Working `--tools` set (omp 18.2): `read,grep,glob,edit,write` (`edit` is find/replace). Use all five for code-writing tasks, `read,grep,glob` for read-only ones.
 - Write a complete, self-contained prompt: Qwen has none of this conversation's context. Name the files, the goal, and the output format you want back.
 - Anything likely to take more than about 2 minutes: run it with `run_in_background` and wait for the notification.
-- `--thinking`: `low` for mechanical tasks, `medium` by default, `high` only when it's worth the wait.
+- `--thinking`: `low` by default (the server caps it at 4,096 thinking tokens), `medium` (8,192) for tricky logic. `high` maps to the server's uncapped xhigh: only use it when it's worth a very long wait. The Swift finetune can think through a whole 16k reply at xhigh and leave no answer.
 
 ## 3. Verify, then accept or send back
 
@@ -69,3 +112,4 @@ omp -p --no-session --model <omp model id> --thinking <low|medium|high> --tools 
 4. **Fix small problems yourself.** For bigger ones, run Qwen again, quoting the exact failure or diff lines and what should change.
 5. **If two rounds of feedback haven't fixed it,** write it yourself and tell the user why.
 6. **Report honestly:** say what Qwen wrote, what you changed, and what you tested.
+7. **Log it:** `qwen-run.mjs` appends the line itself; add what you fixed to its notes column. Otherwise append one line to the project's `qwen/ledger.csv` (`date,task,brief_chars,diff_chars,reruns,notes`; diff chars = added lines of Qwen's diff, or the drafted file's size). Give the user a token-savings recap from this ledger at each project stage. Recap: tokens ≈ chars/3.5 for code, /4 for prose; net saved = Qwen's output minus briefs; name the ratio, the reruns, and which tasks paid off.

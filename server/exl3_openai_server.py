@@ -129,14 +129,6 @@ class BatchPump:
         if self.task is None:
             self.task = asyncio.get_running_loop().create_task(self._pump())
 
-    def _announce(self, previous: int, active: int):
-        if active >= 2 and previous < 2:
-            print("\n=========================================================================", flush=True)
-            print(f"  CONCURRENCY RUNNING  {active}/{self.slots} slots", flush=True)
-            print("=========================================================================\n", flush=True)
-        elif previous >= 2 and active < 2:
-            print(f"\n  concurrency dropped to {active}/{self.slots}\n", flush=True)
-
     async def _pump(self):
         while True:
             if self.generator is None or self.generator.num_remaining_jobs() == 0:
@@ -161,9 +153,7 @@ class BatchPump:
         self._ensure()
         q: asyncio.Queue = asyncio.Queue()
         serial = None
-        previous = self.active
         self.active += 1
-        self._announce(previous, self.active)
         try:
             serial = self.generator.enqueue(job)
             self.queues[serial] = q
@@ -183,9 +173,7 @@ class BatchPump:
                         gen.cancel(job)
                     except Exception:
                         pass
-            previous = self.active
             self.active = max(0, self.active - 1)
-            self._announce(previous, self.active)
 
 
 def _live_tag(res: dict | None = None) -> str:
@@ -257,11 +245,14 @@ class LlamaConsole:
     state.  finish() prints the final timing block and the release line."""
 
     def __init__(self, task: int, n_ctx: int, n_prompt: int, draft_name: str | None = None, poll=None,
-                 every: float | None = None, slot: int = 0, chunk_note: str = ""):
+                 every: float | None = None, slot: int = 0, chunk_note: str = "", worker: dict | None = None):
         self.task, self.n_ctx, self.n_prompt, self.draft_name, self.poll = task, n_ctx, n_prompt, draft_name, poll
+        self.worker = worker                  # _worker_for(): the client conversation this request belongs to
+        self.meta = ""                        # effort / budget of the request, for requests.log
+        self.budget_hit = False
         self.every = CONSOLE_EVERY if every is None else every
         self.chunk_note = chunk_note          # e.g. "the engine reports once per 2048-token chunk"
-        self.pre = f"id {slot:2d} | task {task}"
+        self.pre = f"id {slot:2d} | task {task}" + (f" | worker {worker['name']}" if worker else "")
         self.lock = threading.Lock()
         self.t0 = time.time()
         self.n_cache, self.cache_exact, self._cache_shown = None, False, None
@@ -279,12 +270,19 @@ class LlamaConsole:
 
     # ---------------------------------------------------------------- lifecycle
     def launch(self):
-        lc_print(f"slot launch_slot_: {self.pre} | processing task")
-        lc_print(f"slot update_slots: {self.pre} | new prompt, n_ctx_slot = {self.n_ctx}, "
-                 f"n_prompt_tokens = {self.n_prompt}")
+        _board_register(self)
+        if _BOARD["on"]:
+            lc_print(f"worker {self._wname()} | task {self.task} start: {self.n_prompt:,} prompt tokens")
+        else:
+            lc_print(f"slot launch_slot_: {self.pre} | processing task")
+            lc_print(f"slot update_slots: {self.pre} | new prompt, n_ctx_slot = {self.n_ctx}, "
+                     f"n_prompt_tokens = {self.n_prompt}")
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         return self
+
+    def _wname(self) -> str:
+        return self.worker["name"] if self.worker else "?"
 
     def _stop_ticker(self):
         self.stop_evt.set()
@@ -301,7 +299,7 @@ class LlamaConsole:
             show = self.n_cache != self._cache_shown          # print once; again only if the value changes
             if show:
                 self._cache_shown = self.n_cache
-        if show:
+        if show and not _BOARD["on"]:
             how = "reused from cache" if exact else "reused from cache, inferred from the engine's rate"
             lc_print(f"slot update_slots: {self.pre} | n_past = {self.n_cache} ({how}), "
                      f"n_tokens to eval = {max(0, self.n_prompt - self.n_cache)}")
@@ -326,8 +324,9 @@ class LlamaConsole:
             cached = f" ({self.n_cache:,} cached)" if self.n_cache else ""
             took = (f"{self.prompt_ms / 1000.0:.2f} s" if self.prompt_ms < 60000.0
                     else _lc_dur(self.prompt_ms / 1000.0))
-        lc_print(f"slot update_slots: {self.pre} | prompt done: {fresh:,} / {fresh:,} tokens in {took}, "
-                 f"{1000.0 * fresh / max(self.prompt_ms, 1e-6):.0f} t/s{cached}")
+        if not _BOARD["on"]:
+            lc_print(f"slot update_slots: {self.pre} | prompt done: {fresh:,} / {fresh:,} tokens in {took}, "
+                     f"{1000.0 * fresh / max(self.prompt_ms, 1e-6):.0f} t/s{cached}")
 
     def tokens(self, n_gen: int, t_first: float | None = None):
         with self.lock:
@@ -395,7 +394,7 @@ class LlamaConsole:
                 continue
             next_print += self.every
             line = self._line()
-            if line and not self.stop_evt.is_set():
+            if line and not self.stop_evt.is_set() and not _BOARD["on"]:
                 lc_print(line)
 
     # ---------------------------------------------------------------- end of a request
@@ -410,6 +409,15 @@ class LlamaConsole:
             ttft = "-" if self.t_first is None else f"{(self.t_first - self.t0) * 1000.0:.2f} ms"
         fresh = max(0, self.n_prompt - int(n_cache))
         pms, dms, ng = float(prompt_ms), float(decode_ms), int(n_gen)
+        _board_retire(self, ng)
+        _req_log(f"task {self.task} worker {self._wname()} {self.meta} prompt {self.n_prompt} cached {int(n_cache)} "
+                 f"out {ng} {dms / 1000.0:.1f}s finish {finish}" + (" THINK-CAP-HIT" if self.budget_hit else "")
+                 + (f" {note}" if note else ""))
+        if _BOARD["on"]:
+            lc_print(f"worker {self._wname()} | task {self.task} done: {ng:,} tokens in {_lc_dur(dms / 1000.0)} "
+                     f"({1000.0 * ng / max(dms, 1e-6):.0f} t/s), prompt {self.n_prompt:,} "
+                     f"({int(n_cache):,} cached), finish = {finish}" + (f", {note}" if note else ""))
+            return
         block = [
             f"prompt eval time = {pms:10.2f} ms / {fresh:5d} tokens ({pms / max(fresh, 1):8.2f} ms per token, "
             f"{1000.0 * fresh / max(pms, 1e-6):8.2f} tokens per second)",
@@ -437,13 +445,144 @@ class LlamaConsole:
                 return
             self.closed = True
             ng = self.n_gen if n_gen is None else int(n_gen)
+        _board_retire(self, ng)
+        _req_log(f"task {self.task} worker {self._wname()} {self.meta} prompt {self.n_prompt} out {ng} ABORTED")
         lc_print(f"slot      release: {self.pre} | stop processing: n_past = {self.n_prompt + ng}, truncated = 0")
 
     def error(self, msg: str):
         self._stop_ticker()
         with self.lock:
             self.closed = True
+        _board_retire(self, self.n_gen)
         lc_print(f"srv    send_error: task id = {self.task}, error: {msg}", "E")
+
+
+# ------------------------------------------------------------------------------------------------ concurrency board
+# When two or more clients work at once, per-request tick lines interleave into noise.  So while the board is on,
+# requests print only a one-line start and a one-line finish, and every BOARD_EVERY seconds one line shows each
+# worker and the total.  A "worker" is one client conversation, keyed by its first user message, so a coding agent
+# keeps its letter across the many requests of its session (a context compaction may give it a new letter).
+# A worker between requests (running its tools) still counts as active for BOARD_GRACE seconds, so the board does
+# not flap on and off at every tool call.
+BOARD_EVERY = float(os.environ.get("BOARD_EVERY", "3.0") or 3.0)
+BOARD_GRACE = 20.0
+_BOARD: dict[str, Any] = {"on": False, "thread": None, "seq": 0}
+_LIVE: dict[int, "LlamaConsole"] = {}        # id(console) -> console, while its request runs
+_WORKERS: dict[str, dict] = {}               # conversation key -> {"name", "out", "reqs", "seen"}
+
+
+def _worker_for(messages) -> dict:
+    """The worker (client conversation) a request belongs to."""
+    first = ""
+    for msg in messages or []:
+        if msg.get("role") == "user":
+            c = msg.get("content") or ""
+            first = c if isinstance(c, str) else json.dumps(c, sort_keys=True, default=str)[:20000]
+            break
+    key = hashlib.sha1(first.encode("utf-8", "replace")).hexdigest()
+    with _LC_LOCK:
+        w = _WORKERS.get(key)
+        if w is None:
+            if len(_WORKERS) >= 64:
+                idle = [k for k, v in _WORKERS.items() if not any(c.worker is v for c in _LIVE.values())]
+                for k in sorted(idle, key=lambda k: _WORKERS[k]["seen"])[:16]:
+                    del _WORKERS[k]
+            n = _BOARD["seq"]
+            _BOARD["seq"] += 1
+            name = chr(65 + n % 26) + ("" if n < 26 else str(n // 26))
+            w = _WORKERS[key] = {"name": name, "out": 0, "reqs": 0, "seen": time.time()}
+        w["reqs"] += 1
+        w["seen"] = time.time()
+    return w
+
+
+def _board_register(con):
+    with _LC_LOCK:
+        _LIVE[id(con)] = con
+        if _BOARD["thread"] is None:
+            _BOARD["thread"] = threading.Thread(target=_board_loop, daemon=True)
+            _BOARD["thread"].start()
+
+
+def _board_retire(con, n_gen: int):
+    """A request ended: its tokens join its worker's total (once)."""
+    with _LC_LOCK:
+        if _LIVE.pop(id(con), None) is not None and con.worker is not None:
+            con.worker["out"] += max(0, int(n_gen))
+            con.worker["seen"] = time.time()
+
+
+def _k(n: float) -> str:
+    return f"{n / 1000.0:.1f}k" if n >= 10000 else f"{int(n):,}"
+
+
+def _board_loop():
+    prev: dict[str, int] = {}                 # worker name -> its total tokens at the last line
+    span = {"t0": 0.0, "start": {}}           # the current concurrent stretch: start time, totals at its start
+    t_prev = time.time()
+    while True:
+        time.sleep(BOARD_EVERY)
+        now = time.time()
+        with _LC_LOCK:
+            live = list(_LIVE.values())
+            cur = {}                          # worker name -> (worker, its live consoles)
+            for w in _WORKERS.values():
+                if now - w["seen"] <= BOARD_GRACE:
+                    cur[w["name"]] = (w, [])
+            for c in live:
+                if c.worker is not None:
+                    cur.setdefault(c.worker["name"], (c.worker, []))[1].append(c)
+            totals = {name: w["out"] + sum(c.n_gen for c in cons) for name, (w, cons) in cur.items()}
+        busy = len(cur) >= 2 and len(live) >= 1
+        if busy and not _BOARD["on"]:
+            _BOARD["on"] = True
+            span["t0"], span["start"] = now, dict(totals)
+            prev, t_prev = dict(totals), now
+            lc_print("=" * 20 + f" CONCURRENCY: {len(cur)} workers ({', '.join(sorted(cur))}) share the GPU; "
+                     f"one line every {BOARD_EVERY:g} s " + "=" * 20)
+            continue
+        if not busy:
+            if _BOARD["on"]:
+                _BOARD["on"] = False
+                el = max(now - span["t0"], 1e-6)
+                names = set(span["start"]) | set(totals)
+                made = {n: totals.get(n, prev.get(n, 0)) - span["start"].get(n, 0) for n in names}
+                made = {n: v for n, v in made.items() if v > 0}
+                total = sum(made.values())
+                lc_print("=" * 20 + f" concurrency over after {_lc_dur(el)}: "
+                         + ", ".join(f"{n} {v:,}" for n, v in sorted(made.items()))
+                         + f" -> {total:,} tokens, {total / el:.0f} t/s combined " + "=" * 20)
+            prev, t_prev = dict(totals), now
+            continue
+        dt = max(now - t_prev, 1e-6)
+        parts, sum_rate, sum_pp = [], 0.0, 0.0
+        for name in sorted(cur):
+            w, cons = cur[name]
+            rate = max(0, totals[name] - prev.get(name, totals[name])) / dt
+            sum_rate += rate
+            made = _k(totals[name] - span["start"].get(name, 0))
+            if not cons:
+                parts.append(f"{name}: tools/idle {_lc_dur(now - w['seen'])}, {made} out")
+                continue
+            c = cons[0]
+            with c.lock:
+                decoding, pos, cache, n_gen = c.t_dec0 is not None, c.pos, c.n_cache or 0, c.n_gen
+                pp_rate = c.pp_rate or 0.0
+            if decoding:
+                what = f"writing {rate:3.0f} t/s ({n_gen:,} this reply)"
+            elif pos is None:
+                what = f"queued/starting ({_k(c.n_prompt)} prompt)"
+            else:
+                fresh = max(1, c.n_prompt - cache)
+                what = (f"reading prompt {100.0 * min(fresh, max(0, pos - cache)) / fresh:3.0f}% of {_k(fresh)} "
+                        f"at {pp_rate:.0f} t/s")
+                sum_pp += pp_rate
+            parts.append(f"{name}: {what}, {made} out")
+        made = sum(totals[n] - span["start"].get(n, 0) for n in totals)
+        lc_print(f"[{_lc_dur(now - span['t0']):>6}] " + " | ".join(parts)
+                 + f" || TOTAL writing {sum_rate:3.0f} t/s" + (f" + reading {sum_pp:.0f} t/s" if sum_pp else "")
+                 + f", {_k(made)} out")
+        prev, t_prev = dict(totals), now
 
 
 # ExLlamaV3 side of the console: every number is read from the generator's own job state (kv_position, cached
@@ -493,10 +632,21 @@ def _exl3_poll(job, prompt_tokens: int):
     return poll
 
 
-def exl3_console(job, req_id: int, prompt_tokens: int) -> LlamaConsole:
+REQ_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.log")
+
+
+def _req_log(line: str):
+    try:
+        with open(REQ_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+    except OSError:
+        pass
+
+
+def exl3_console(job, req_id: int, prompt_tokens: int, worker: dict | None = None) -> LlamaConsole:
     draft = "DFlash2" if STATE.get("draft_model") is not None else None
     return LlamaConsole(req_id, int(STATE.get("cache_size", 0) or 0), prompt_tokens, draft,
-                        poll=_exl3_poll(job, prompt_tokens)).launch()
+                        poll=_exl3_poll(job, prompt_tokens), worker=worker).launch()
 
 
 def exl3_finish(con: LlamaConsole, last_res: dict, job, prompt_tokens: int, finish: str):
@@ -893,6 +1043,9 @@ async def chat_completions(request: Request):
         reasoning_effort = STATE["default_reasoning_effort"]
 
     reasoning_budget = int(body.get("reasoning_budget") or STATE.get("default_reasoning_budget", 2048))
+    effort_cap = STATE.get("effort_budgets", {}).get(reasoning_effort, 0)
+    if not body.get("reasoning_budget") and effort_cap > 0:
+        reasoning_budget = effort_cap if reasoning_budget <= 0 else min(reasoning_budget, effort_cap)
     reasoning_budget_msg = STATE.get(
         "default_reasoning_budget_msg",
         " ... reasoning budget reached, finalize response now.",
@@ -938,6 +1091,7 @@ async def chat_completions(request: Request):
     model_name = body.get("model", "qwen3.8-27b")
     req_id = _next_req_id()
     req_note = _snippet(cleaned_messages)
+    worker = _worker_for(cleaned_messages)
     batch: BatchPump = STATE["batch"]
 
     if not stream:
@@ -949,7 +1103,8 @@ async def chat_completions(request: Request):
                 sampler=sampler,
                 embeddings=image_embeddings if image_embeddings else None,
             )
-            con = exl3_console(job, req_id, prompt_tokens)
+            con = exl3_console(job, req_id, prompt_tokens, worker)
+            con.meta = f"effort {reasoning_effort} think-budget {reasoning_budget} max_new {max_tokens}"
 
             full_text = ""
             last_res = {}
@@ -1018,6 +1173,7 @@ async def chat_completions(request: Request):
                             and cur_tokens >= reasoning_budget
                         ):
                             budget_enforced = True
+                            con.budget_hit = True
                             job.constrain_output_now(f"{reasoning_budget_msg}\n</think>\n\n")
                         if penalty_active[0] and (("<tool_call>" in full_text) or (tools and "</think>" in full_text)):
                             penalty_active[0] = False
@@ -1108,7 +1264,8 @@ async def chat_completions(request: Request):
                     sampler=sampler,
                     embeddings=image_embeddings if image_embeddings else None,
                 )
-                con = exl3_console(job, req_id, prompt_tokens)
+                con = exl3_console(job, req_id, prompt_tokens, worker)
+                con.meta = f"effort {reasoning_effort} think-budget {reasoning_budget} max_new {max_tokens}"
                 # Initial role chunk
                 first_chunk = {
                     "id": completion_id,
@@ -1137,8 +1294,13 @@ async def chat_completions(request: Request):
                 cached_toks_init = 0
                 prefill_done_logged = False
                 budget_enforced = False
+                dc_checked = time.perf_counter()
 
                 async for res in STATE["batch"].events(job):
+                    if time.perf_counter() - dc_checked > 1.0:
+                        dc_checked = time.perf_counter()
+                        if await request.is_disconnected():
+                            raise asyncio.CancelledError()
                     stage = res.get("stage")
                     if stage == "started":
                         pp_start_t = time.perf_counter()
@@ -1190,6 +1352,7 @@ async def chat_completions(request: Request):
                             and cur_tokens >= reasoning_budget
                         ):
                             budget_enforced = True
+                            con.budget_hit = True
                             job.constrain_output_now(f"{reasoning_budget_msg}\n</think>\n\n")
                         now_t = time.perf_counter()
                         dt = now_t - win_t
@@ -1356,6 +1519,12 @@ async def chat_completions(request: Request):
             if con is not None:
                 con.cancelled()
                 con.abort()
+                gen = STATE["generator"]
+                if job in gen.pending_jobs or job in gen.active_jobs:
+                    try:
+                        gen.cancel(job)
+                    except Exception:
+                        pass
             raise
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -1400,6 +1569,66 @@ class QuietPollingFilter(logging.Filter):
         return True
 
 
+def _keep_accepting_on_windows():
+    """Python 3.11's Proactor event loop (uvicorn's default on Windows) closes the listening socket for good when one
+    accept() fails, e.g. WinError 64 when a client drops a connection before it is accepted. The server then keeps
+    generating for open requests but refuses every new one. Re-arm the accept instead. (The Selector loop is no way
+    out: Windows select() caps at 512 sockets and a burst of connections kills the whole loop.)"""
+    import sys
+    if sys.platform != "win32":
+        return
+    from asyncio import exceptions, proactor_events
+
+    def _start_serving(self, protocol_factory, sock, sslcontext=None, server=None, backlog=100,
+                       ssl_handshake_timeout=None, ssl_shutdown_timeout=None):
+        def loop(f=None):
+            conn = None
+            try:
+                if f is not None:
+                    conn, addr = f.result()
+                    protocol = protocol_factory()
+                    if sslcontext is not None:
+                        self._make_ssl_transport(
+                            conn, protocol, sslcontext, server_side=True, extra={"peername": addr}, server=server,
+                            ssl_handshake_timeout=ssl_handshake_timeout, ssl_shutdown_timeout=ssl_shutdown_timeout)
+                    else:
+                        self._make_socket_transport(conn, protocol, extra={"peername": addr}, server=server)
+                    conn = None  # owned by its transport now
+                if self.is_closed():
+                    return
+                f = self._proactor.accept(sock)
+            except OSError as exc:
+                if sock.fileno() == -1:
+                    return  # the server itself closed the socket: stop quietly
+                if conn is not None:
+                    conn.close()
+                errors[0] += 1
+                now = time.monotonic()
+                if now - errors[1] >= 5:  # a burst of dropped clients can queue hundreds of these
+                    print(f"  [accept] {exc!r} (x{errors[0]}): still listening", flush=True)
+                    errors[1] = now
+                # Drain dead connections at once; back off only if accept() keeps failing, so it can't spin
+                self.call_later(0.05 if errors[0] % 1000 == 0 else 0, loop)
+            except exceptions.CancelledError:
+                sock.close()
+            else:
+                self._accept_futures[sock.fileno()] = f
+                f.add_done_callback(loop)
+
+        errors = [0, 0.0]  # accept failures so far, time of the last log line
+        self.call_soon(loop)
+
+    proactor_events.BaseProactorEventLoop._start_serving = _start_serving
+
+    # Each dropped connection also leaves asyncio's internal accept task with an unread WinError 64, which it logs as
+    # a full "Task exception was never retrieved" traceback. It's already handled above, so keep the console clean.
+    def _not_dropped_accept(record):
+        exc = record.exc_info[1] if record.exc_info else None
+        return not (isinstance(exc, OSError) and getattr(exc, "winerror", None) == 64)
+
+    logging.getLogger("asyncio").addFilter(_not_dropped_accept)
+
+
 def main():
     parser = argparse.ArgumentParser()
     from exllamav3 import model_init
@@ -1423,6 +1652,9 @@ def main():
     parser.add_argument("--frequency-penalty", type=float, default=0.0)
     parser.add_argument("--reasoning-effort", type=str, default="xhigh")
     parser.add_argument("--reasoning-budget", type=int, default=2048)
+    parser.add_argument("--effort-budgets", type=str, default="low=4096,medium=8192",
+                        help="thinking cap per requested reasoning effort, e.g. low=4096,medium=8192 ('' = none); "
+                             "a cap of 0 or an effort not listed keeps --reasoning-budget")
     parser.add_argument(
         "--reasoning-budget-message",
         type=str,
@@ -1430,6 +1662,9 @@ def main():
     )
     parser.add_argument("--reasoning-preserve", action="store_true", default=True)
     parser.add_argument("--no-vision", action="store_true")
+    parser.add_argument("--max-chunk-size", type=int, default=512,
+                        help="prompt tokens read per generator step; smaller = shorter stalls for the other slot "
+                             "while one reads a long prompt (engine default 2048)")
     parser.add_argument("--open-browser", action="store_true", help="Open http://host:port/ in default browser when ready")
     args = parser.parse_args()
 
@@ -1452,6 +1687,8 @@ def main():
     STATE["default_reasoning_effort"] = args.reasoning_effort
     STATE["default_reasoning_budget"] = 0 if is_instruct else args.reasoning_budget
     STATE["default_reasoning_budget_msg"] = args.reasoning_budget_message
+    STATE["effort_budgets"] = {} if is_instruct else {
+        k.strip(): int(v) for k, v in (pair.split("=", 1) for pair in args.effort_budgets.split(",") if "=" in pair)}
     STATE["default_reasoning_preserve"] = args.reasoning_preserve
 
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
@@ -1473,6 +1710,7 @@ def main():
         tokenizer=tokenizer,
         draft_model=draft_model,
         draft_cache=draft_cache,
+        max_chunk_size=max(128, int(args.max_chunk_size)),
     )
 
     STATE["model"] = model
@@ -1499,7 +1737,11 @@ def main():
     STATE["batch"].configure(generator, slots)
 
     print(f"  Context Pool : {args.cache_size:,} tokens ({args.cache_quant}-bit KV Cache)")
-    print(f"  Concurrency  : {slots} slots  (this window prints CONCURRENCY RUNNING when 2 or more overlap)")
+    print(f"  Prompt chunk : {max(128, int(args.max_chunk_size))} tokens per step (--max-chunk-size)")
+    if STATE["effort_budgets"]:
+        caps = ", ".join(f"{k} {v:,}" for k, v in STATE["effort_budgets"].items())
+        print(f"  Think caps   : {caps} tokens when a client asks for that effort (--effort-budgets)")
+    print(f"  Concurrency  : {slots} slots  (with 2+ clients working, one status line per worker every few seconds)")
     print(f"  Vision Tower : {'Loaded (6-bit)' if STATE['vision_model'] else 'Disabled'}")
     print(f"  VRAM Usage   : {vram_alloc:.2f} GiB allocated / {vram_res:.2f} GiB reserved")
     print("=========================================================================")
@@ -1510,6 +1752,7 @@ def main():
         browser_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{browser_host}:{args.port}/")).start()
 
+    _keep_accepting_on_windows()
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
