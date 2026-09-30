@@ -129,14 +129,6 @@ class BatchPump:
         if self.task is None:
             self.task = asyncio.get_running_loop().create_task(self._pump())
 
-    def _announce(self, previous: int, active: int):
-        if active >= 2 and previous < 2:
-            print("\n=========================================================================", flush=True)
-            print(f"  CONCURRENCY RUNNING  {active}/{self.slots} slots", flush=True)
-            print("=========================================================================\n", flush=True)
-        elif previous >= 2 and active < 2:
-            print(f"\n  concurrency dropped to {active}/{self.slots}\n", flush=True)
-
     async def _pump(self):
         while True:
             if self.generator is None or self.generator.num_remaining_jobs() == 0:
@@ -161,9 +153,7 @@ class BatchPump:
         self._ensure()
         q: asyncio.Queue = asyncio.Queue()
         serial = None
-        previous = self.active
         self.active += 1
-        self._announce(previous, self.active)
         try:
             serial = self.generator.enqueue(job)
             self.queues[serial] = q
@@ -183,9 +173,7 @@ class BatchPump:
                         gen.cancel(job)
                     except Exception:
                         pass
-            previous = self.active
             self.active = max(0, self.active - 1)
-            self._announce(previous, self.active)
 
 
 def _live_tag(res: dict | None = None) -> str:
@@ -220,230 +208,12 @@ def _next_req_id() -> int:
 
 
 # ------------------------------------------------------------------------------------------------ console
-# llama-server style console with honest numbers (the same helper in Strata's serve/server.py and in
-# exl3_openai_server.py, so both windows read and count alike):
-#   * prefill progress and "prompt eval" count only FRESH prompt tokens; reused (cached) tokens are shown apart,
-#     never inside a speed
-#   * decode counts and times come from the engine (Strata: T lines and DONE; ExLlamaV3: job.new_tokens,
-#     time_first_token, and the final result's new_tokens / time_generate), never from re-tokenized text
-#   * a ticker prints about every CONSOLE_EVERY seconds; token counts are only what the engine has reported, the
-#     elapsed time is live and the "left" estimate is marked with ~
-#   * no timestamps, ASCII only
-_LC_LOCK = threading.Lock()
-CONSOLE_EVERY = float(os.environ.get("CONSOLE_EVERY", "1.0") or 1.0)
+# The live console (one status line per second for one request; a block every 2 s while two or more requests run or
+# wait; one line per finished request) lives in console_view.py, the same file Strata's serve/ uses.
+import console_view as cv  # noqa: E402
+from console_view import LlamaConsole, lc_print  # noqa: E402,F401
 
-
-def _lc_dur(sec: float) -> str:
-    """12 s, 3m05s, 1h02m."""
-    sec = max(0, int(round(sec)))
-    if sec < 60:
-        return f"{sec} s"
-    if sec < 3600:
-        return f"{sec // 60}m{sec % 60:02d}s"
-    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
-
-
-def lc_print(msg: str, level: str = "I", extra: list[str] | None = None):
-    """One console record; `extra` lines follow unprefixed (like llama-server's timing block)."""
-    with _LC_LOCK:
-        print(f"{level} {msg}", flush=True)
-        for line in extra or []:
-            print(line, flush=True)
-
-
-class LlamaConsole:
-    """One request (llama-server "task") in the console.  Feed it what the engine reports: set_cache(), progress(),
-    prompt_done(), tokens(); or give it `poll(con)`, which the ticker calls before each line to read live engine
-    state.  finish() prints the final timing block and the release line."""
-
-    def __init__(self, task: int, n_ctx: int, n_prompt: int, draft_name: str | None = None, poll=None,
-                 every: float | None = None, slot: int = 0, chunk_note: str = ""):
-        self.task, self.n_ctx, self.n_prompt, self.draft_name, self.poll = task, n_ctx, n_prompt, draft_name, poll
-        self.every = CONSOLE_EVERY if every is None else every
-        self.chunk_note = chunk_note          # e.g. "the engine reports once per 2048-token chunk"
-        self.pre = f"id {slot:2d} | task {task}"
-        self.lock = threading.Lock()
-        self.t0 = time.time()
-        self.n_cache, self.cache_exact, self._cache_shown = None, False, None
-        self.pos = None                       # absolute prompt position last reported by the engine
-        self.pp_rate = None                   # fresh tokens / s, as reported
-        self.pp_t = None                      # when that report arrived (wall clock)
-        self.prompt_ms = None
-        self.t_dec0 = None                    # decode clock start (wall clock), the engine's own where known
-        self.n_gen = 0
-        self.t_first = None                   # first generated token (wall clock)
-        self.win = None
-        self.closed = False
-        self.stop_evt = threading.Event()
-        self.thread = None
-
-    # ---------------------------------------------------------------- lifecycle
-    def launch(self):
-        lc_print(f"slot launch_slot_: {self.pre} | processing task")
-        lc_print(f"slot update_slots: {self.pre} | new prompt, n_ctx_slot = {self.n_ctx}, "
-                 f"n_prompt_tokens = {self.n_prompt}")
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-        return self
-
-    def _stop_ticker(self):
-        self.stop_evt.set()
-        if self.thread is not None and self.thread is not threading.current_thread():
-            self.thread.join(timeout=2.0)
-
-    # ---------------------------------------------------------------- engine facts
-    def set_cache(self, n_cache: int, exact: bool = True):
-        """Prompt tokens reused from the cache (not evaluated again)."""
-        with self.lock:
-            if self.cache_exact and not exact:
-                return
-            self.n_cache, self.cache_exact = int(n_cache), exact or self.cache_exact
-            show = self.n_cache != self._cache_shown          # print once; again only if the value changes
-            if show:
-                self._cache_shown = self.n_cache
-        if show:
-            how = "reused from cache" if exact else "reused from cache, inferred from the engine's rate"
-            lc_print(f"slot update_slots: {self.pre} | n_past = {self.n_cache} ({how}), "
-                     f"n_tokens to eval = {max(0, self.n_prompt - self.n_cache)}")
-
-    def progress(self, pos: int, rate: float, t_report: float | None = None):
-        """The engine reached absolute prompt position `pos` at `t_report` (wall clock, default now), having read
-        fresh tokens at `rate` tok/s up to then."""
-        with self.lock:
-            self.pos, self.pp_rate = int(pos), float(rate)
-            self.pp_t = time.time() if t_report is None else float(t_report)
-
-    def prompt_done(self, n_cache: int, prompt_ms: float, t_dec0: float | None = None):
-        """Prefill finished; the decode clock starts at t_dec0 (wall clock; now if not given)."""
-        self.set_cache(n_cache, True)
-        with self.lock:
-            if self.prompt_ms is not None:
-                return
-            self.prompt_ms = float(prompt_ms)
-            self.t_dec0 = time.time() if t_dec0 is None else float(t_dec0)
-            self.win = (self.t_dec0, 0)
-            fresh = max(0, self.n_prompt - self.n_cache)
-            cached = f" ({self.n_cache:,} cached)" if self.n_cache else ""
-            took = (f"{self.prompt_ms / 1000.0:.2f} s" if self.prompt_ms < 60000.0
-                    else _lc_dur(self.prompt_ms / 1000.0))
-        lc_print(f"slot update_slots: {self.pre} | prompt done: {fresh:,} / {fresh:,} tokens in {took}, "
-                 f"{1000.0 * fresh / max(self.prompt_ms, 1e-6):.0f} t/s{cached}")
-
-    def tokens(self, n_gen: int, t_first: float | None = None):
-        with self.lock:
-            self.n_gen = max(self.n_gen, int(n_gen))
-            if self.t_first is None and t_first is not None:
-                self.t_first = float(t_first)
-
-    def token(self):
-        with self.lock:
-            self.n_gen += 1
-            if self.t_first is None:
-                self.t_first = time.time()
-
-    # ---------------------------------------------------------------- live numbers
-    def live(self) -> dict:
-        """llama.cpp-named live timings for API chunks (prompt_n = fresh tokens, cache_n = reused)."""
-        with self.lock:
-            cache = self.n_cache or 0
-            fresh = max(0, self.n_prompt - cache)
-            pms = self.prompt_ms if self.prompt_ms is not None else (time.time() - self.t0) * 1000.0
-            dms = (time.time() - self.t_dec0) * 1000.0 if self.t_dec0 else 0.0
-            return {"cache_n": cache, "prompt_n": fresh, "prompt_ms": round(pms, 2),
-                    "prompt_per_second": round(1000.0 * fresh / max(pms, 1e-6), 2),
-                    "predicted_n": self.n_gen, "predicted_ms": round(dms, 2),
-                    "predicted_per_second": round(1000.0 * self.n_gen / dms, 2) if dms > 0 else 0.0}
-
-    def _line(self) -> str | None:
-        now = time.time()
-        with self.lock:
-            if self.t_dec0 is None:                                  # prefill
-                # counts: the engine's last report (never interpolated); elapsed: live; left: ~ from the rate
-                cache = self.n_cache or 0
-                cached = f" ({cache:,} cached)" if cache else ""
-                fresh_total = max(1, self.n_prompt - cache)
-                el = _lc_dur(now - self.t0)
-                if self.pos is None or self.n_cache is None:
-                    note = f", {self.chunk_note}" if self.chunk_note else ""
-                    return (f"slot update_slots: {self.pre} | prompt processing: {fresh_total:,} tokens to read, "
-                            f"{el} elapsed{note}{cached}")
-                done = min(fresh_total, max(0, self.pos - cache))
-                left = ""
-                if self.pp_rate > 0:
-                    left = f", ~{_lc_dur(max(0.0, (fresh_total - done) / self.pp_rate - (now - self.pp_t)))} left"
-                return (f"slot update_slots: {self.pre} | prompt processing: {done:,} / {fresh_total:,} tokens "
-                        f"({100.0 * done / fresh_total:.1f}%), {self.pp_rate:.0f} t/s, {el} elapsed{left}{cached}")
-            t_w, n_w = self.win
-            dt = now - t_w
-            inst = (self.n_gen - n_w) / dt if dt > 0 else 0.0
-            self.win = (now, self.n_gen)
-            dec = now - self.t_dec0
-            avg = self.n_gen / dec if dec > 0 else 0.0
-            return (f"slot print_timing: {self.pre} | n_gen = {self.n_gen}, tg = {avg:.2f} t/s, "
-                    f"tg_1s = {inst:.2f} t/s")
-
-    def _run(self):
-        step = min(0.1, self.every) if self.poll is not None else self.every   # poll often, print every `every`
-        next_print = time.time() + self.every
-        while not self.stop_evt.wait(step):
-            if self.poll is not None:
-                try:
-                    self.poll(self)
-                except Exception:
-                    pass
-            if time.time() < next_print:
-                continue
-            next_print += self.every
-            line = self._line()
-            if line and not self.stop_evt.is_set():
-                lc_print(line)
-
-    # ---------------------------------------------------------------- end of a request
-    def finish(self, prompt_ms: float, n_cache: int, decode_ms: float, n_gen: int, finish: str = "stop",
-               draft_accepted: int | None = None, draft_total: int | None = None, note: str = ""):
-        """The engine's final numbers: prompt_ms / decode_ms / n_gen / draft counts exactly as it reported them."""
-        self._stop_ticker()
-        with self.lock:
-            if self.closed:
-                return
-            self.closed = True
-            ttft = "-" if self.t_first is None else f"{(self.t_first - self.t0) * 1000.0:.2f} ms"
-        fresh = max(0, self.n_prompt - int(n_cache))
-        pms, dms, ng = float(prompt_ms), float(decode_ms), int(n_gen)
-        block = [
-            f"prompt eval time = {pms:10.2f} ms / {fresh:5d} tokens ({pms / max(fresh, 1):8.2f} ms per token, "
-            f"{1000.0 * fresh / max(pms, 1e-6):8.2f} tokens per second)",
-            f"       eval time = {dms:10.2f} ms / {ng:5d} tokens ({dms / max(ng, 1):8.2f} ms per token, "
-            f"{1000.0 * ng / max(dms, 1e-6):8.2f} tokens per second)",
-            f"      total time = {pms + dms:10.2f} ms / {fresh + ng:5d} tokens",
-        ]
-        if draft_total is not None and draft_accepted is not None and self.draft_name:
-            rate = draft_accepted / draft_total if draft_total else 0.0
-            block.append(f"{self.draft_name} draft acceptance rate = {rate:0.5f} ({draft_accepted:5d} accepted / "
-                         f"{draft_total:5d} generated)")
-        block.append(f"     prompt cache = {int(n_cache)} of {self.n_prompt} prompt tokens reused, ttft = {ttft}, finish = {finish}"
-                     + (f", {note}" if note else ""))
-        lc_print(f"slot print_timing: {self.pre} |", extra=block)
-        lc_print(f"slot      release: {self.pre} | stop processing: n_past = {self.n_prompt + ng}, truncated = 0")
-
-    def cancelled(self, detail: str = ""):
-        lc_print(f"srv          stop: cancel task, id_task = {self.task}" + (f" ({detail})" if detail else ""), "W")
-
-    def abort(self, n_gen: int | None = None):
-        """The request ended without final numbers (client gone): release with what is known."""
-        self._stop_ticker()
-        with self.lock:
-            if self.closed:
-                return
-            self.closed = True
-            ng = self.n_gen if n_gen is None else int(n_gen)
-        lc_print(f"slot      release: {self.pre} | stop processing: n_past = {self.n_prompt + ng}, truncated = 0")
-
-    def error(self, msg: str):
-        self._stop_ticker()
-        with self.lock:
-            self.closed = True
-        lc_print(f"srv    send_error: task id = {self.task}, error: {msg}", "E")
+_worker_for = cv.worker_for
 
 
 # ExLlamaV3 side of the console: every number is read from the generator's own job state (kv_position, cached
@@ -493,10 +263,43 @@ def _exl3_poll(job, prompt_tokens: int):
     return poll
 
 
-def exl3_console(job, req_id: int, prompt_tokens: int) -> LlamaConsole:
+REQ_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.log")
+
+
+def _req_log(line: str):
+    try:
+        with open(REQ_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+    except OSError:
+        pass
+
+
+def _log_finish(con, n_cache, decode_ms, n_gen, finish, note):
+    w = con.worker["name"] if con.worker else "?"
+    _req_log(f"task {con.task} worker {w} {con.meta} prompt {con.n_prompt} cached {int(n_cache)} "
+             f"out {int(n_gen)} {decode_ms / 1000.0:.1f}s finish {finish}" + (" THINK-CAP-HIT" if con.budget_hit else "")
+             + (f" {note}" if note else ""))
+
+
+def _log_abort(con, n_gen):
+    w = con.worker["name"] if con.worker else "?"
+    _req_log(f"task {con.task} worker {w} {con.meta} prompt {con.n_prompt} out {int(n_gen)} ABORTED")
+
+
+cv.ON_FINISH, cv.ON_ABORT = _log_finish, _log_abort
+
+
+async def wait_for_slot(req_id: int, worker):
+    """The GPU slots are all busy: show this request as waiting until it gets one (the caller then takes the lock)."""
+    if not STATE["lock"].locked():
+        return None
+    return cv.Waiting(req_id, worker, f"for a free slot ({STATE.get('slots', '?')} busy)")
+
+
+def exl3_console(job, req_id: int, prompt_tokens: int, worker: dict | None = None) -> LlamaConsole:
     draft = "DFlash2" if STATE.get("draft_model") is not None else None
     return LlamaConsole(req_id, int(STATE.get("cache_size", 0) or 0), prompt_tokens, draft,
-                        poll=_exl3_poll(job, prompt_tokens)).launch()
+                        poll=_exl3_poll(job, prompt_tokens), worker=worker).launch()
 
 
 def exl3_finish(con: LlamaConsole, last_res: dict, job, prompt_tokens: int, finish: str):
@@ -893,6 +696,9 @@ async def chat_completions(request: Request):
         reasoning_effort = STATE["default_reasoning_effort"]
 
     reasoning_budget = int(body.get("reasoning_budget") or STATE.get("default_reasoning_budget", 2048))
+    effort_cap = STATE.get("effort_budgets", {}).get(reasoning_effort, 0)
+    if not body.get("reasoning_budget") and effort_cap > 0:
+        reasoning_budget = effort_cap if reasoning_budget <= 0 else min(reasoning_budget, effort_cap)
     reasoning_budget_msg = STATE.get(
         "default_reasoning_budget_msg",
         " ... reasoning budget reached, finalize response now.",
@@ -938,10 +744,17 @@ async def chat_completions(request: Request):
     model_name = body.get("model", "qwen3.8-27b")
     req_id = _next_req_id()
     req_note = _snippet(cleaned_messages)
+    worker = _worker_for(cleaned_messages)
     batch: BatchPump = STATE["batch"]
 
     if not stream:
-        async with STATE["lock"]:
+        waiter = await wait_for_slot(req_id, worker)
+        try:
+            await STATE["lock"].acquire()
+        finally:
+            if waiter is not None:
+                waiter.done()
+        try:
             job = Job(
                 input_ids=input_ids,
                 max_new_tokens=max_tokens,
@@ -949,7 +762,9 @@ async def chat_completions(request: Request):
                 sampler=sampler,
                 embeddings=image_embeddings if image_embeddings else None,
             )
-            con = exl3_console(job, req_id, prompt_tokens)
+            con = exl3_console(job, req_id, prompt_tokens, worker)
+            con.meta = f"effort {reasoning_effort} think-budget {reasoning_budget} max_new {max_tokens}"
+            con.phase = "thinking" if enable_thinking else "answering"
 
             full_text = ""
             last_res = {}
@@ -1010,6 +825,8 @@ async def chat_completions(request: Request):
                         cur_tokens += step_toks
                         win_tokens += step_toks
                         full_text += piece
+                        if con.phase == "thinking" and "</think>" in full_text:
+                            con.phase = "answering"
                         if (
                             enable_thinking
                             and reasoning_budget > 0
@@ -1018,6 +835,7 @@ async def chat_completions(request: Request):
                             and cur_tokens >= reasoning_budget
                         ):
                             budget_enforced = True
+                            con.budget_hit = True
                             job.constrain_output_now(f"{reasoning_budget_msg}\n</think>\n\n")
                         if penalty_active[0] and (("<tool_call>" in full_text) or (tools and "</think>" in full_text)):
                             penalty_active[0] = False
@@ -1032,6 +850,8 @@ async def chat_completions(request: Request):
                     if res.get("eos"):
                         last_res = res
                         break
+        finally:
+            STATE["lock"].release()
 
         new_tokens = int(last_res.get("new_tokens", cur_tokens))
         t_gen = float(last_res.get("time_generate", 0.01))
@@ -1100,7 +920,13 @@ async def chat_completions(request: Request):
         cur_tokens = 0
         con = None
         try:
-            async with STATE["lock"]:
+            waiter = await wait_for_slot(req_id, worker)
+            try:
+                await STATE["lock"].acquire()
+            finally:
+                if waiter is not None:
+                    waiter.done()
+            try:
                 job = Job(
                     input_ids=input_ids,
                     max_new_tokens=max_tokens,
@@ -1108,7 +934,8 @@ async def chat_completions(request: Request):
                     sampler=sampler,
                     embeddings=image_embeddings if image_embeddings else None,
                 )
-                con = exl3_console(job, req_id, prompt_tokens)
+                con = exl3_console(job, req_id, prompt_tokens, worker)
+                con.meta = f"effort {reasoning_effort} think-budget {reasoning_budget} max_new {max_tokens}"
                 # Initial role chunk
                 first_chunk = {
                     "id": completion_id,
@@ -1120,6 +947,7 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps(first_chunk)}\n\n"
 
                 in_thinking = bool(enable_thinking)
+                con.phase = "thinking" if in_thinking else "answering"
                 buffer = ""
                 full_text = ""
                 in_tool_call = False
@@ -1137,8 +965,13 @@ async def chat_completions(request: Request):
                 cached_toks_init = 0
                 prefill_done_logged = False
                 budget_enforced = False
+                dc_checked = time.perf_counter()
 
                 async for res in STATE["batch"].events(job):
+                    if time.perf_counter() - dc_checked > 1.0:
+                        dc_checked = time.perf_counter()
+                        if await request.is_disconnected():
+                            raise asyncio.CancelledError()
                     stage = res.get("stage")
                     if stage == "started":
                         pp_start_t = time.perf_counter()
@@ -1190,6 +1023,7 @@ async def chat_completions(request: Request):
                             and cur_tokens >= reasoning_budget
                         ):
                             budget_enforced = True
+                            con.budget_hit = True
                             job.constrain_output_now(f"{reasoning_budget_msg}\n</think>\n\n")
                         now_t = time.perf_counter()
                         dt = now_t - win_t
@@ -1221,6 +1055,7 @@ async def chat_completions(request: Request):
                                     }
                                     yield f"data: {json.dumps(chunk)}\n\n"
                                 in_thinking = False
+                                con.phase = "answering"
                                 if tools:
                                     penalty_active[0] = False
                                 buffer = rest.lstrip("\r\n")
@@ -1250,6 +1085,7 @@ async def chat_completions(request: Request):
                                     }
                                     yield f"data: {json.dumps(chunk)}\n\n"
                                 in_tool_call = True
+                                con.phase = "tool call"
                                 penalty_active[0] = False
                                 buffer = "<tool_call>" + tc_rest
                             elif len(buffer) > 16:
@@ -1268,6 +1104,8 @@ async def chat_completions(request: Request):
                     if res.get("eos"):
                         last_res = res
                         break
+            finally:
+                STATE["lock"].release()
 
             # Flush remaining buffer
             if in_thinking and buffer:
@@ -1356,6 +1194,12 @@ async def chat_completions(request: Request):
             if con is not None:
                 con.cancelled()
                 con.abort()
+                gen = STATE["generator"]
+                if job in gen.pending_jobs or job in gen.active_jobs:
+                    try:
+                        gen.cancel(job)
+                    except Exception:
+                        pass
             raise
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -1390,14 +1234,79 @@ class QuietPollingFilter(logging.Filter):
         "GET /pwa-",
         "GET /maskable-",
         "GET /version.json",
+        "GET /tools",           # the web UI probing for features this server doesn't have (404/405)
+        "POST /tools",
+        "GET /build.json",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
+        if "POST " in msg and '" 200' in msg:          # each request already has its own console lines
+            return False
         for p in self.QUIET_PREFIXES:
             if p in msg:
                 return False
         return True
+
+
+def _keep_accepting_on_windows():
+    """Python 3.11's Proactor event loop (uvicorn's default on Windows) closes the listening socket for good when one
+    accept() fails, e.g. WinError 64 when a client drops a connection before it is accepted. The server then keeps
+    generating for open requests but refuses every new one. Re-arm the accept instead. (The Selector loop is no way
+    out: Windows select() caps at 512 sockets and a burst of connections kills the whole loop.)"""
+    import sys
+    if sys.platform != "win32":
+        return
+    from asyncio import exceptions, proactor_events
+
+    def _start_serving(self, protocol_factory, sock, sslcontext=None, server=None, backlog=100,
+                       ssl_handshake_timeout=None, ssl_shutdown_timeout=None):
+        def loop(f=None):
+            conn = None
+            try:
+                if f is not None:
+                    conn, addr = f.result()
+                    protocol = protocol_factory()
+                    if sslcontext is not None:
+                        self._make_ssl_transport(
+                            conn, protocol, sslcontext, server_side=True, extra={"peername": addr}, server=server,
+                            ssl_handshake_timeout=ssl_handshake_timeout, ssl_shutdown_timeout=ssl_shutdown_timeout)
+                    else:
+                        self._make_socket_transport(conn, protocol, extra={"peername": addr}, server=server)
+                    conn = None  # owned by its transport now
+                if self.is_closed():
+                    return
+                f = self._proactor.accept(sock)
+            except OSError as exc:
+                if sock.fileno() == -1:
+                    return  # the server itself closed the socket: stop quietly
+                if conn is not None:
+                    conn.close()
+                errors[0] += 1
+                now = time.monotonic()
+                if now - errors[1] >= 5:  # a burst of dropped clients can queue hundreds of these
+                    print(f"  [accept] {exc!r} (x{errors[0]}): still listening", flush=True)
+                    errors[1] = now
+                # Drain dead connections at once; back off only if accept() keeps failing, so it can't spin
+                self.call_later(0.05 if errors[0] % 1000 == 0 else 0, loop)
+            except exceptions.CancelledError:
+                sock.close()
+            else:
+                self._accept_futures[sock.fileno()] = f
+                f.add_done_callback(loop)
+
+        errors = [0, 0.0]  # accept failures so far, time of the last log line
+        self.call_soon(loop)
+
+    proactor_events.BaseProactorEventLoop._start_serving = _start_serving
+
+    # Each dropped connection also leaves asyncio's internal accept task with an unread WinError 64, which it logs as
+    # a full "Task exception was never retrieved" traceback. It's already handled above, so keep the console clean.
+    def _not_dropped_accept(record):
+        exc = record.exc_info[1] if record.exc_info else None
+        return not (isinstance(exc, OSError) and getattr(exc, "winerror", None) == 64)
+
+    logging.getLogger("asyncio").addFilter(_not_dropped_accept)
 
 
 def main():
@@ -1423,6 +1332,9 @@ def main():
     parser.add_argument("--frequency-penalty", type=float, default=0.0)
     parser.add_argument("--reasoning-effort", type=str, default="xhigh")
     parser.add_argument("--reasoning-budget", type=int, default=2048)
+    parser.add_argument("--effort-budgets", type=str, default="low=4096,medium=8192",
+                        help="thinking cap per requested reasoning effort, e.g. low=4096,medium=8192 ('' = none); "
+                             "a cap of 0 or an effort not listed keeps --reasoning-budget")
     parser.add_argument(
         "--reasoning-budget-message",
         type=str,
@@ -1430,6 +1342,9 @@ def main():
     )
     parser.add_argument("--reasoning-preserve", action="store_true", default=True)
     parser.add_argument("--no-vision", action="store_true")
+    parser.add_argument("--max-chunk-size", type=int, default=512,
+                        help="prompt tokens read per generator step; smaller = shorter stalls for the other slot "
+                             "while one reads a long prompt (engine default 2048)")
     parser.add_argument("--open-browser", action="store_true", help="Open http://host:port/ in default browser when ready")
     args = parser.parse_args()
 
@@ -1452,6 +1367,8 @@ def main():
     STATE["default_reasoning_effort"] = args.reasoning_effort
     STATE["default_reasoning_budget"] = 0 if is_instruct else args.reasoning_budget
     STATE["default_reasoning_budget_msg"] = args.reasoning_budget_message
+    STATE["effort_budgets"] = {} if is_instruct else {
+        k.strip(): int(v) for k, v in (pair.split("=", 1) for pair in args.effort_budgets.split(",") if "=" in pair)}
     STATE["default_reasoning_preserve"] = args.reasoning_preserve
 
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
@@ -1473,6 +1390,7 @@ def main():
         tokenizer=tokenizer,
         draft_model=draft_model,
         draft_cache=draft_cache,
+        max_chunk_size=max(128, int(args.max_chunk_size)),
     )
 
     STATE["model"] = model
@@ -1496,10 +1414,16 @@ def main():
     print(f"  Sampler (Gov): temp={STATE['default_temp']}, top_p={STATE['default_top_p']}, top_k={STATE['default_top_k']}, min_p={STATE['default_min_p']}, pres_p={STATE['default_pres_p']}")
     slots = max(1, int(args.autosplit_max_batch_size))
     STATE["lock"] = asyncio.Semaphore(slots)
+    STATE["slots"] = slots
     STATE["batch"].configure(generator, slots)
 
     print(f"  Context Pool : {args.cache_size:,} tokens ({args.cache_quant}-bit KV Cache)")
-    print(f"  Concurrency  : {slots} slots  (this window prints CONCURRENCY RUNNING when 2 or more overlap)")
+    print(f"  Prompt chunk : {max(128, int(args.max_chunk_size))} tokens per step (--max-chunk-size)")
+    if STATE["effort_budgets"]:
+        caps = ", ".join(f"{k} {v:,}" for k, v in STATE["effort_budgets"].items())
+        print(f"  Think caps   : {caps} tokens when a client asks for that effort (--effort-budgets)")
+    print(f"  Concurrency  : {slots} slots  (the live panel at the bottom shows every running and queued request;"
+          " letters A, B, ... are client conversations)")
     print(f"  Vision Tower : {'Loaded (6-bit)' if STATE['vision_model'] else 'Disabled'}")
     print(f"  VRAM Usage   : {vram_alloc:.2f} GiB allocated / {vram_res:.2f} GiB reserved")
     print("=========================================================================")
@@ -1510,6 +1434,7 @@ def main():
         browser_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{browser_host}:{args.port}/")).start()
 
+    _keep_accepting_on_windows()
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

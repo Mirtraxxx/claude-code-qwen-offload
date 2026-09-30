@@ -13,6 +13,7 @@ What's in here:
 | `skill/qwen-delegate/SKILL.md` | Claude Code skill: when and how to delegate to Qwen, and how to verify the result |
 | `claude-md/CLAUDE.md.snippet` | Policy section for `~/.claude/CLAUDE.md` that makes delegation the default |
 | `server/exl3_openai_server.py` | OpenAI-compatible FastAPI server on exllamav3, with DFlash2 speculative decoding and request batching |
+| `server/console_view.py` | The server's live console: a panel pinned at the bottom (or plain lines with `CONSOLE_STYLE=lines`), one line per finished request, and a worker letter per client conversation |
 | `server/launch-27b.bat` | Windows launcher for the 27B with the recommended settings (`-ambs 2`) |
 | `server/requirements.txt` | Python deps for the server (versions from the reference machine) |
 | `patches/dflash2-contiguous.patch` | exllamav3 1.5.1 fix needed for batching with DFlash2 |
