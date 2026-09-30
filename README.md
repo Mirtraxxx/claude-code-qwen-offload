@@ -11,6 +11,7 @@ What's in here:
 | Path | What it is |
 |---|---|
 | `skill/qwen-delegate/SKILL.md` | Claude Code skill: when and how to delegate to Qwen, and how to verify the result |
+| `skill/qwen-delegate/qwen-run.mjs` | Wrapper that runs one coding job: adds house rules to the brief, runs omp headless, diffs the project into `%TEMP%\qwen-runs\`, flags empty/timeout/out-of-scope runs, and appends a ledger line |
 | `claude-md/CLAUDE.md.snippet` | Policy section for `~/.claude/CLAUDE.md` that makes delegation the default |
 | `server/exl3_openai_server.py` | OpenAI-compatible FastAPI server on exllamav3, with DFlash2 speculative decoding and request batching |
 | `server/console_view.py` | The server's live console: a panel pinned at the bottom (or plain lines with `CONSOLE_STYLE=lines`), one line per finished request, and a worker letter per client conversation |
@@ -121,6 +122,8 @@ and omp's own subagent fan-out is off. The reference machine also points omp's s
 ```powershell
 Copy-Item -Recurse skill\qwen-delegate "$env:USERPROFILE\.claude\skills\"
 ```
+
+The wrapper needs Node 18+ and `omp` on the PATH (`node qwen-run.mjs` with no arguments prints its options).
 
 In the installed `SKILL.md`, replace `<QWEN_SERVER_DIR>` with the folder that holds the server and
 launcher (and delete the Flash-Next row if you don't run it). Then paste

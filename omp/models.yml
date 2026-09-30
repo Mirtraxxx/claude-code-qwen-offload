@@ -12,6 +12,9 @@ providers:
       supportsDeveloperRole: false
       supportsReasoningEffort: true
       thinkingFormat: qwen
+      # Required: without it omp sends no reasoning_effort at all, so --thinking low silently
+      # runs at the server's default (xhigh, unlimited thinking).
+      qwenTemplateReasoningEffort: true
       reasoningEffortMap:
         minimal: low
         low: low

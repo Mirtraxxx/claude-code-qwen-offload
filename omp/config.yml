@@ -21,3 +21,16 @@ task:
     - security-reviewer
     - task
     - sonic
+
+# Compaction tuned for two workers sharing the 27B's 131k context pool.
+# - thresholdTokens 40000: two workers fit the pool with room for output.
+# - keepRecentTokens 8000: at the default 20000, workers re-hit the threshold 2-3 turns after compacting.
+# - methodOrder: the default snapcompact archives history as images of text that the 27B can't read back,
+#   so workers thrash (compact, re-read, compact). A handoff is an LLM call (1-3 min at low).
+compaction:
+  thresholdTokens: 40000
+  keepRecentTokens: 8000
+  methodOrder:
+    - handoff
+    - soft
+    - shake
