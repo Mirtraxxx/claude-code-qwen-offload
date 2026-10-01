@@ -11,7 +11,7 @@ What's in here:
 | Path | What it is |
 |---|---|
 | `skill/qwen-delegate/SKILL.md` | Claude Code skill: when and how to delegate to Qwen, and how to verify the result |
-| `skill/qwen-delegate/qwen-run.mjs` | Wrapper that runs one coding job: adds house rules to the brief, runs omp headless, diffs the project into `%TEMP%\qwen-runs\`, flags empty/timeout/out-of-scope runs, and appends a ledger line |
+| `skill/qwen-delegate/qwen-run.mjs` | Wrapper that runs one coding job: adds house rules to the brief, runs omp headless, diffs the project into `%TEMP%\qwen-runs\`, flags empty/timeout/out-of-scope runs plus removed imports/definitions and duplicated functions, and appends a ledger line that counts only the job's own files |
 | `claude-md/CLAUDE.md.snippet` | Policy section for `~/.claude/CLAUDE.md` that makes delegation the default |
 | `server/exl3_openai_server.py` | OpenAI-compatible FastAPI server on exllamav3, with DFlash2 speculative decoding and request batching |
 | `server/console_view.py` | The server's live console: a panel pinned at the bottom (or plain lines with `CONSOLE_STYLE=lines`), one line per finished request, and a worker letter per client conversation |
@@ -182,6 +182,20 @@ Claude writes those either way. Convert at about 3.5 chars per token for code an
 - **Net: about 14–15k Claude output tokens saved, a return of about 3.5×.** Output tokens cost
   about 5× input tokens, and reviewing a diff mostly costs input (reading), not output.
 
+**Measured across five projects** (about 35 jobs over six days, mostly on the 27B, recounted with the fixed wrapper):
+
+| Project | Qwen wrote | Claude's briefs | Net saved | Return |
+|---|---|---|---|---|
+| JavaScript browser game prototype (the one above, later) | 161.8k chars | 67.5k | ~27k tokens | 2.4× |
+| Browser evolution sim, 2D → 3D → voxel | 98.1k | 40.7k | ~16k | 2.4× |
+| Python data analyzer with a test suite | 123.2k | 52.8k | ~20k | 2.3× |
+| Python emulator-automation bot | 29.4k | 17.3k | ~3.5k | 1.7× |
+| Python server console module | 26.7k | 17.0k | ~3k | 1.6× |
+| **Total** | **~439k** | **~195k** | **~70k tokens** | **~2.25×** |
+
+For the first ~30 jobs, the recaps given during those sessions added up to about 110k against a
+recounted ~62k. That was a counting bug (see the lessons below), not Qwen doing worse.
+
 **Caveats.**
 
 - In Qwen's favour: Claude would also have spent thinking tokens writing that code itself, and
@@ -196,3 +210,14 @@ Claude writes those either way. Convert at about 3.5 chars per token for code an
   ~3k-char diff. It's only worth delegating if Claude can do other work in parallel meanwhile.
 - Keep a ledger: one CSV line per Qwen job with task, brief chars, diff chars and reruns.
   `ledger.example.csv` has the header (`date,task,brief_chars,diff_chars,reruns,notes`).
+- Count only the job's own files. A plain before/after diff of the whole folder credits a job with
+  whatever a parallel job (or Claude) changed meanwhile, and a file with no "before" copy counts in
+  full. That inflated our early recaps by about 1.8×. `qwen-run.mjs` now keeps a before-copy of every
+  text file and credits only `--files`, so always pass `--files`.
+- Qwen's most common bug is deleting lines it wasn't asked to touch: imports, a data field, a
+  `<style>` line, a fallback `return`. It happened 6 times in about 30 jobs, and several would have
+  crashed the program. The runner-up is adding a new version of a function and leaving the old one
+  below it. The wrapper now flags both (`REMOVED-CODE`, `DUPLICATE-DEF`), but still read the diff:
+  it can't see a deleted field or `return`.
+- What needs the least fixing: UI, CSS and written content. What needs the most: logic the brief
+  doesn't spell out (performance, error paths, simulation numbers) and Qwen's own test fixtures.
