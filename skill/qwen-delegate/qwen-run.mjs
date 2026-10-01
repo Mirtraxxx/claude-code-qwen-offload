@@ -3,7 +3,7 @@
 // Node 24, ES module, no npm dependencies.
 
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, mkdtempSync, existsSync, statSync, readdirSync, copyFileSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, mkdtempSync, existsSync, statSync, readdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -13,7 +13,9 @@ const HOUSE_RULES = `House rules for this job:
 - Read at most 3 files per turn. Prefer reading the part of a file you need over the whole file when the file is long.
 - Use \`write\` only to create a file that does not exist yet. To change an existing file, including one you created earlier in this job, use \`edit\`. Never rewrite a whole existing file.
 - Only create or change the files the task names. Do not touch anything else.
-- When you are done, reply with a short summary of what you changed.
+- Never delete existing code the task does not ask you to change. That includes imports, fields, fallback returns and lines in HTML templates such as <style> or <script>. If you think something must go, leave it and say so in your summary.
+- When you replace a function or block with a new version, remove the old version, so only one copy exists.
+- When you are done, reply with a short summary of what you changed, and list anything you deleted.
 `;
 
 // ---------- arg parsing ----------
@@ -124,9 +126,11 @@ async function detectModel() {
 
 // ---------- step 2: snapshot ----------
 
-const SKIP_DIRS = new Set(["node_modules", ".git", "qwen"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", "qwen", "__pycache__"]);
+// files up to this size keep their old contents, so every change diffs against the real "before"
+const KEEP_BYTES = 512 * 1024;
 
-function snapshot(cwd) {
+function snapshot(cwd, keep = false) {
   const map = new Map();
   let count = 0, warned = false;
   const walk = (dir) => {
@@ -142,10 +146,12 @@ function snapshot(cwd) {
       } else if (entry.isFile()) {
         const st = statSync(full);
         const rel = path.relative(cwd, full).split(path.sep).join("/");
+        const buf = readFileSync(full);
         map.set(rel, {
           size: st.size,
           mtimeMs: st.mtimeMs,
-          sha1: crypto.createHash("sha1").update(readFileSync(full)).digest("hex"),
+          sha1: crypto.createHash("sha1").update(buf).digest("hex"),
+          buf: keep && st.size <= KEEP_BYTES ? buf : null,
         });
         count++;
       }
@@ -195,17 +201,10 @@ if (!existsSync(briefPath)) { console.error(`brief not found: ${briefPath}`); pr
 const model = opts.model ?? await detectModel();
 const briefText = readFileSync(briefPath, "utf8");
 
-// snapshot + temp folder with copies of the expected files
+// snapshot (keeping old contents in memory) + temp folder for the diff's old side
 const tmp = mkdtempSync(path.join(os.tmpdir(), "qwen-run-"));
 const snapDir = path.join(tmp, "snap");
-const before = snapshot(cwd);
-for (const rel of files) {
-  const src = path.join(cwd, rel);
-  if (!existsSync(src)) continue;
-  const dest = path.join(snapDir, rel);
-  mkdirSync(path.dirname(dest), { recursive: true });
-  copyFileSync(src, dest);
-}
+const before = snapshot(cwd, true);
 const emptyFile = path.join(tmp, ".empty");
 writeFileSync(emptyFile, "");
 
@@ -266,25 +265,70 @@ const diffName = `${stamp()}-${slug(opts.task)}.diff`;
 const diffPath = path.join(runsDir, diffName);
 const outPath = path.join(runsDir, diffName.replace(/\.diff$/, ".out.txt"));
 
+// only the job's own files count toward the ledger; anything else changed in the folder
+// meanwhile (a parallel job, Claude's own edits) is listed but not credited to this job
+const inScope = (rel) => files.length === 0 || files.includes(rel);
+
+// lines whose deletion has broken things before: imports, definitions, template tags
+const KEY_LINE = /^\s*(import\s|from\s+\S+\s+import\s|(export\s+)?(default\s+)?(async\s+)?(def|class|function)\s+\w|(export\s+)?(const|let|var)\s+\w+\s*=\s*(require\(|await import\()|<(style|script|link)\b)/;
+// definitions that should exist once per file: top-level Python defs/classes, JS functions anywhere
+function defNames(text, rel) {
+  const re = /\.py$/.test(rel)
+    ? /^(?:async\s+)?(?:def|class)\s+(\w+)/gm
+    : /\.(m?js|cjs|jsx?|tsx?|html?)$/.test(rel)
+      ? /^\s*(?:export\s+)?(?:async\s+)?function\s*\*?\s*(\w+)\s*\(/gm
+      : null;
+  const counts = new Map();
+  if (!re) return counts;
+  for (const m of text.matchAll(re)) counts.set(m[1], (counts.get(m[1]) ?? 0) + 1);
+  return counts;
+}
+
 let diffText = "";
 const addedChars = new Map();
+const removedKey = [];   // "file: line" for key lines removed and not re-added anywhere in the file
+const duplicates = [];   // "file: name x2" for definitions that became duplicated
 for (const rel of [...changed, ...added, ...removed]) {
-  const oldSide = existsSync(path.join(snapDir, rel)) ? path.join(snapDir, rel) : emptyFile;
+  const prev = before.get(rel);
+  let oldSide = emptyFile;
+  if (prev?.buf) {
+    oldSide = path.join(snapDir, rel);
+    mkdirSync(path.dirname(oldSide), { recursive: true });
+    writeFileSync(oldSide, prev.buf);
+  }
   const newSide = existsSync(path.join(cwd, rel)) ? path.join(cwd, rel) : emptyFile;
   const r = spawnSync("git", ["diff", "--no-index", "--no-color", "--", oldSide, newSide], { encoding: "utf8" });
   const text = r.stdout ?? "";
   diffText += text;
   let n = 0;
+  const plus = new Set(), minus = [];
   for (const line of text.split("\n")) {
-    if (line.startsWith("+") && !line.startsWith("+++")) n += line.length;
+    if (line.startsWith("+") && !line.startsWith("+++")) { n += line.length; plus.add(line.slice(1).trim()); }
+    else if (line.startsWith("-") && !line.startsWith("---")) minus.push(line.slice(1));
   }
   addedChars.set(rel, n);
+  if (!inScope(rel) || !prev?.buf) continue;
+  for (const line of minus) {
+    if (KEY_LINE.test(line) && !plus.has(line.trim())) removedKey.push(`${rel}: ${line.trim().slice(0, 100)}`);
+  }
+  if (existsSync(newSide) && newSide !== emptyFile) {
+    const oldDefs = defNames(prev.buf.toString("utf8"), rel);
+    for (const [name, count] of defNames(readFileSync(newSide, "utf8"), rel)) {
+      if (count > 1 && count > (oldDefs.get(name) ?? 0)) duplicates.push(`${rel}: ${name} x${count}`);
+    }
+  }
+}
+// brand-new files have no old side; still check them for duplicated definitions
+for (const rel of added.filter(inScope)) {
+  for (const [name, count] of defNames(readFileSync(path.join(cwd, rel), "utf8"), rel)) {
+    if (count > 1) duplicates.push(`${rel}: ${name} x${count}`);
+  }
 }
 writeFileSync(diffPath, diffText);
 writeFileSync(outPath, stdout);
-let diffChars = 0;
-for (const line of diffText.split("\n")) {
-  if (line.startsWith("+") && !line.startsWith("+++")) diffChars += line.length;
+let diffChars = 0, otherChars = 0;
+for (const [rel, n] of addedChars) {
+  if (inScope(rel)) diffChars += n; else otherChars += n;
 }
 
 // step 7: flags
@@ -302,6 +346,8 @@ if (outOfScope.length > 0) {
 }
 const missing = files.filter((rel) => !changed.includes(rel) && !added.includes(rel));
 if (missing.length > 0) flags.push(`MISSING:${missing.slice(0, 5).join(";")}${missing.length > 5 ? ";..." : ""}`);
+if (removedKey.length > 0) flags.push(`REMOVED-CODE:${removedKey.length}`);
+if (duplicates.length > 0) flags.push(`DUPLICATE-DEF:${duplicates.map((d) => d.replace(/ x\d+$/, "")).slice(0, 3).join(";")}`);
 
 // step 8: ledger
 let ledgerLine;
@@ -311,6 +357,8 @@ if (opts.noLedger) {
   ledgerLine = `skipped, no ledger file at ${ledgerPath}`;
 } else {
   const notes = `${model.split("/").pop()} ${opts.thinking} ${fmtDur(elapsedSec)} ${fmtNum(changed.length + added.length + removed.length)} files` +
+    (files.length === 0 ? " NO-FILES-LIST (diff_chars counts every changed file)" : "") +
+    (otherChars > 0 ? ` (+${otherChars} chars in other files not counted)` : "") +
     (flags.length > 0 ? ` FLAGS ${flags.join(";")}` : "");
   const row = [
     stamp().slice(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3"),
@@ -334,9 +382,18 @@ console.log(`  answer    ${fmtNum(stdout.length)} chars`);
 console.log(`  changed   ${listLine(changed)}`);
 console.log(`  added     ${listLine(added)}`);
 console.log(`  removed   ${listLine(removed)}`);
-console.log(`  diff      ${fmtNum(diffChars)} added chars -> ${diffPath}`);
+console.log(`  diff      ${fmtNum(diffChars)} added chars in the job's files` +
+  (otherChars > 0 ? ` (+${fmtNum(otherChars)} in other files, not counted)` : "") + ` -> ${diffPath}`);
 console.log(`  ledger    ${ledgerLine}`);
 console.log(`  FLAGS     ${flags.length === 0 ? "none" : flags.join("; ")}`);
+if (removedKey.length > 0) {
+  console.log("--- removed imports/definitions (check each one was meant to go) ---");
+  for (const r of removedKey) console.log(`  ${r}`);
+}
+if (duplicates.length > 0) {
+  console.log("--- definitions that now appear more than once (old copy left behind?) ---");
+  for (const d of duplicates) console.log(`  ${d}`);
+}
 console.log("--- answer ---");
 console.log(stdout);
 

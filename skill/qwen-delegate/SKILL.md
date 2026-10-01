@@ -79,10 +79,11 @@ node "$HOME/.claude/skills/qwen-delegate/qwen-run.mjs" --cwd "<project dir>" --b
 ```
 
 What the wrapper does:
-- Detects the model and prepends house rules to the brief: work incrementally, at most 3 reads per turn, `write` only for new files, touch only the listed files.
+- Detects the model and prepends house rules to the brief: work incrementally, at most 3 reads per turn, `write` only for new files, touch only the listed files, never delete code the task doesn't ask to change (and list any deletions), and remove the old copy when replacing a function.
 - Snapshots the project, runs omp with stdin closed (otherwise `omp -p` hangs waiting for piped input), and diffs the result into `%TEMP%\qwen-runs\<time>-<task>.diff`.
 - Flags `EMPTY-ANSWER`, `TIMEOUT`, `EXIT-n`, `NO-CHANGES`, `OUT-OF-SCOPE:` and `MISSING:`.
-- Appends the ledger line to `<cwd>/qwen/ledger.csv` when that file exists.
+- Also flags `REMOVED-CODE:n` (imports, defs/classes/functions, `<style>`/`<script>`/`<link>` lines removed from a listed file and not re-added) and `DUPLICATE-DEF:` (a function or top-level Python def that now exists twice: the old copy was left behind). It prints each line under the answer. Qwen's most common bug is deleting a line it wasn't asked to touch (6 times by 2026-09-30, several would have crashed), so check every listed removal.
+- Appends the ledger line to `<cwd>/qwen/ledger.csv` when that file exists. `diff_chars` counts only the files in `--files`; changes elsewhere in the folder (a parallel job, your own edits) are noted but not credited. **Always pass `--files`**: without it every changed file counts, which inflated the 2026-09-28/30 ledgers by up to 3x on parallel runs.
 - Exit codes: 0 clean, 1 flags, 2 bad args, 3 no server, 4 omp missing.
 - Use `--dry-run` to see the command, and `--no-ledger` for throwaway runs.
 
