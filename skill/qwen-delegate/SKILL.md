@@ -85,7 +85,8 @@ What the wrapper does:
 - Also flags `REMOVED-CODE:n` (imports, defs/classes/functions, `<style>`/`<script>`/`<link>` lines removed from a listed file and not re-added) and `DUPLICATE-DEF:` (a function or top-level Python def that now exists twice: the old copy was left behind). It prints each line under the answer. Qwen's most common bug is deleting a line it wasn't asked to touch (6 times by 2026-09-30, several would have crashed), so check every listed removal.
 - Appends the ledger line to `<cwd>/qwen/ledger.csv` when that file exists. `diff_chars` counts only the files in `--files`; changes elsewhere in the folder (a parallel job, your own edits) are noted but not credited. **Always pass `--files`**: without it every changed file counts, which inflated the 2026-09-28/30 ledgers by up to 3x on parallel runs.
 - Exit codes: 0 clean, 1 flags, 2 bad args, 3 no server, 4 omp missing.
-- Use `--dry-run` to see the command, and `--no-ledger` for throwaway runs.
+- The snapshot skips images, audio, 3D models, archives, model weights, `node_modules`, venvs, dot-folders and browser profiles (any folder with a `Local State` or `prefs.js`), since Qwen only writes text. Above 20,000 remaining files it stops, compares only the `--files` and flags `SNAPSHOT-CAPPED` (out-of-scope edits go unseen then: check the folder yourself).
+- Use `--dry-run` to see the command, and `--no-ledger` for throwaway runs. `--dry-run` also prints the snapshot's file count.
 
 Then verify the diff file yourself (step 3). The flags are a first filter, not the review. Anything longer than about 2 minutes goes in `run_in_background`.
 

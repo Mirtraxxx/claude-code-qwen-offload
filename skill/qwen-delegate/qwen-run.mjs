@@ -126,38 +126,60 @@ async function detectModel() {
 
 // ---------- step 2: snapshot ----------
 
-const SKIP_DIRS = new Set(["node_modules", ".git", "qwen", "__pycache__"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", "qwen", "__pycache__", "venv", "site-packages"]);
+// Qwen only writes text, so images, audio, 3D models, archives and weights are never read or compared
+// (a project with screenshots and art folders blew the old 5000-file cap and gave false flags)
+const SKIP_EXT = new Set(("png jpg jpeg gif webp bmp tga tif tiff psd ico exr hdr dds ktx ktx2 basis " +
+  "wav mp3 ogg flac m4a aac opus mp4 webm mov avi mkv " +
+  "glb gltf bin fbx obj mtl dae blend vox ply stl usdz " +
+  "tflite pb binarypb onnx hyb " +
+  "zip 7z rar gz tgz bz2 xz tar " +
+  "ttf otf woff woff2 pdf exe dll so dylib pyd pyc " +
+  "safetensors gguf pt pth ckpt onnx npy npz pkl h5 db sqlite sqlite3 ldb log").split(" "));
+const MAX_FILES = 20000;
 // files up to this size keep their old contents, so every change diffs against the real "before"
 const KEEP_BYTES = 512 * 1024;
 
-function snapshot(cwd, keep = false) {
+// a browser profile (e.g. from a perf test) holds thousands of cache files that change on their own
+const isBrowserProfile = (dir) => existsSync(path.join(dir, "Local State")) || existsSync(path.join(dir, "prefs.js"));
+
+// returns Map(rel -> info); map.capped is true when MAX_FILES was hit. The job's --files are
+// always included, even past the cap, so their diff and line checks still work.
+function snapshot(cwd, keep = false, mustHave = []) {
   const map = new Map();
-  let count = 0, warned = false;
+  map.capped = false;
+  const add = (full, rel) => {
+    const st = statSync(full);
+    const buf = readFileSync(full);
+    map.set(rel, {
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      sha1: crypto.createHash("sha1").update(buf).digest("hex"),
+      buf: keep && st.size <= KEEP_BYTES ? buf : null,
+    });
+  };
   const walk = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (count >= 5000) {
-        if (!warned) { console.error("warning: snapshot stopped at 5000 files"); warned = true; }
+      if (map.size >= MAX_FILES) {
+        if (!map.capped) console.error(`warning: snapshot stopped at ${MAX_FILES} files; only the --files are compared`);
+        map.capped = true;
         return;
       }
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".") || isBrowserProfile(full)) continue;
         walk(full);
       } else if (entry.isFile()) {
-        const st = statSync(full);
-        const rel = path.relative(cwd, full).split(path.sep).join("/");
-        const buf = readFileSync(full);
-        map.set(rel, {
-          size: st.size,
-          mtimeMs: st.mtimeMs,
-          sha1: crypto.createHash("sha1").update(buf).digest("hex"),
-          buf: keep && st.size <= KEEP_BYTES ? buf : null,
-        });
-        count++;
+        if (SKIP_EXT.has(path.extname(entry.name).slice(1).toLowerCase())) continue;
+        add(full, path.relative(cwd, full).split(path.sep).join("/"));
       }
     }
   };
   walk(cwd);
+  for (const rel of mustHave) {
+    const full = path.join(cwd, rel);
+    if (!map.has(rel) && existsSync(full) && statSync(full).isFile()) add(full, rel);
+  }
   return map;
 }
 
@@ -204,7 +226,7 @@ const briefText = readFileSync(briefPath, "utf8");
 // snapshot (keeping old contents in memory) + temp folder for the diff's old side
 const tmp = mkdtempSync(path.join(os.tmpdir(), "qwen-run-"));
 const snapDir = path.join(tmp, "snap");
-const before = snapshot(cwd, true);
+const before = snapshot(cwd, true, files);
 const emptyFile = path.join(tmp, ".empty");
 writeFileSync(emptyFile, "");
 
@@ -246,14 +268,18 @@ const { code, stdout, stderr, elapsedSec } = run;
 if (code !== 0 && stderr.trim()) console.error(stderr.trim());
 
 // step 5: second snapshot + compare
-const after = snapshot(cwd);
+const after = snapshot(cwd, false, files);
+// past the cap the two file lists can differ for no reason, so only the job's own files are compared
+const capped = before.capped || after.capped;
+const compared = (rel) => !capped || files.includes(rel);
 const changed = [], added = [], removed = [];
 for (const [rel, info] of after) {
+  if (!compared(rel)) continue;
   const prev = before.get(rel);
   if (!prev) added.push(rel);
   else if (prev.sha1 !== info.sha1) changed.push(rel);
 }
-for (const rel of before.keys()) if (!after.has(rel)) removed.push(rel);
+for (const rel of before.keys()) if (compared(rel) && !after.has(rel)) removed.push(rel);
 const outOfScope = files.length > 0
   ? [...changed, ...added, ...removed].filter((rel) => !files.includes(rel))
   : [];
@@ -347,6 +373,7 @@ if (outOfScope.length > 0) {
 const missing = files.filter((rel) => !changed.includes(rel) && !added.includes(rel));
 if (missing.length > 0) flags.push(`MISSING:${missing.slice(0, 5).join(";")}${missing.length > 5 ? ";..." : ""}`);
 if (removedKey.length > 0) flags.push(`REMOVED-CODE:${removedKey.length}`);
+if (capped) flags.push(`SNAPSHOT-CAPPED:${MAX_FILES}`);
 if (duplicates.length > 0) flags.push(`DUPLICATE-DEF:${duplicates.map((d) => d.replace(/ x\d+$/, "")).slice(0, 3).join(";")}`);
 
 // step 8: ledger
