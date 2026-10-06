@@ -15,6 +15,8 @@ const HOUSE_RULES = `House rules for this job:
 - Only create or change the files the task names. Do not touch anything else.
 - Never delete existing code the task does not ask you to change. That includes imports, fields, fallback returns and lines in HTML templates such as <style> or <script>. If you think something must go, leave it and say so in your summary.
 - When you replace a function or block with a new version, remove the old version, so only one copy exists.
+- You own the exploration: read what you need to understand the code before changing it. If the task gives test or screenshot commands, run them, look at the results (you can read PNG images and see them) and keep iterating until the done criteria pass. Take your time.
+- Never edit qwen/ledger.csv: the wrapper and Claude keep it.
 - When you are done, reply with a short summary of what you changed, and list anything you deleted.
 `;
 
@@ -26,9 +28,9 @@ function usage() {
   --brief <file>     file holding the full task prompt (required)
   --task <label>     short label for the ledger and run files (required)
   --files <list>     comma-separated paths (relative to --cwd) the job may touch
-  --tools <list>     tools passed to omp (default read,grep,glob,edit,write)
-  --thinking <lvl>   low|medium|high (default low)
-  --max-time <dur>   Ns|Nm|Nh (default 30m)
+  --tools <list>     tools passed to omp (default read,grep,glob,edit,write,bash)
+  --thinking <lvl>   low|medium|high (default high = uncapped xhigh)
+  --max-time <dur>   Ns|Nm|Nh (default 90m)
   --model <id>       omp model id (default: auto-detect)
   --ledger <file>    CSV to append to (default <cwd>/qwen/ledger.csv)
   --no-ledger        never append to the ledger
@@ -39,7 +41,7 @@ function usage() {
 function parseArgs(argv) {
   const opts = {
     cwd: null, brief: null, task: null, files: null,
-    tools: "read,grep,glob,edit,write", thinking: "low", maxTime: "30m",
+    tools: "read,grep,glob,edit,write,bash", thinking: "high", maxTime: "90m",
     model: null, ledger: null, noLedger: false, reruns: "0", dryRun: false,
   };
   const boolean = new Set(["--no-ledger", "--dry-run"]);
@@ -121,7 +123,7 @@ async function detectModel() {
   try { body = await res.json(); } catch { body = null; }
   const data = Array.isArray(body?.data) ? body.data : [];
   if (data.length === 0) { console.error("no model server on :8080"); process.exit(3); }
-  return data.some((e) => e.owned_by === "strata" || /iq2|flash/i.test(String(e.id))) ? "llamacpp/qwen3.8-flash-next" : "llamacpp/qwen3.8-27b";
+  return data.some((e) => e.owned_by === "strata" || /swift-1.5-iq|flash/i.test(String(e.id))) ? "llamacpp/qwen3.8-flash-next" : "llamacpp/qwen3.8-27b";
 }
 
 // ---------- step 2: snapshot ----------
@@ -231,7 +233,8 @@ const emptyFile = path.join(tmp, ".empty");
 writeFileSync(emptyFile, "");
 
 // step 3: prompt file
-let prompt = HOUSE_RULES;
+// the label line lets the model server (and the Claude Code Qwen panel) name this worker
+let prompt = `[qwen-job: ${opts.task} @ ${path.basename(cwd)}]\n` + HOUSE_RULES;
 if (files.length > 0) prompt += `- Files you may create or change: ${files.join(", ")}.\n`;
 prompt += "\n" + briefText;
 const promptPath = path.join(tmp, "prompt.md");
@@ -255,6 +258,20 @@ if (opts.dryRun) {
   process.exit(0);
 }
 
+// while omp runs, %TEMP%\qwen-runs\active\<pid>.json says what this job is (the Qwen panel reads it)
+const activeDir = path.join(os.tmpdir(), "qwen-runs", "active");
+const activePath = path.join(activeDir, `${process.pid}.json`);
+const clearActive = () => { try { rmSync(activePath, { force: true }); } catch {} };
+try {
+  mkdirSync(activeDir, { recursive: true });
+  writeFileSync(activePath, JSON.stringify({
+    task: opts.task, project: path.basename(cwd), model, files,
+    started: Date.now(), maxTimeSec, pid: process.pid,
+  }));
+} catch {}
+process.on("exit", clearActive);
+for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK"]) process.on(sig, () => { clearActive(); process.exit(130); });
+
 let run;
 try {
   run = await runOmp(ompArgs, cwd);
@@ -262,6 +279,8 @@ try {
   console.error(`failed to start omp: ${err.message}`);
   rmSync(tmp, { recursive: true, force: true });
   process.exit(4);
+} finally {
+  clearActive();
 }
 const { code, stdout, stderr, elapsedSec } = run;
 // omp's stderr is mostly its "Working..." spinner; only show it when something went wrong

@@ -19,10 +19,11 @@ echo =========================================================================
 echo   Swift 1.5 Qwen 3.8 27B Uncensored (SC_3.75bpw_H5_V6) + DFlash2
 echo   - Mode:       THINKING MODE (enable_thinking=true, effort=xhigh)
 echo   - Reasoning:  Native Swift 1.5 RL/OPD (--reasoning-budget 0, --reasoning-preserve)
+echo   - Think caps: low 4k, medium 8k, xhigh 16k tokens, then forced to answer
 echo   - Official:   temp=0.6 (Coding/DFlash2), top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0
 echo   - Target:     Swift-1.5-Qwen3.8-27B-Uncensored-EXL3-3.75bpw (14.52 GiB, 5-bit Head, 6-bit Vision)
 echo   - Drafter:    Qwen3.8-27B-DFlash2-EXL3-5.0bpw (1.47 GB)
-echo   - Context:    131,072 tokens (-cs 131072, 4,4-bit Hadamard KV Cache)
+echo   - Context:    163,840 tokens (-cs 163840, 4,4-bit Hadamard KV Cache)
 echo   - Batching:   2 concurrent requests (-ambs 2)
 echo   - Web Chat:   http://127.0.0.1:%PORT%/
 echo   - API:        http://127.0.0.1:%PORT%/v1
@@ -33,12 +34,13 @@ echo.
 "%EXL3_PYTHON%" "%~dp0exl3_openai_server.py" ^
   -m "%MODEL_DIR%" ^
   -dm "%DRAFT_DIR%" ^
-  -cs 131072 ^
+  -cs 163840 ^
   -cq 4,4 ^
   -ambs 2 ^
   --mode thinking ^
   --reasoning-effort xhigh ^
   --reasoning-budget 0 ^
+  --effort-budgets low=4096,medium=8192,xhigh=16384 ^
   --reasoning-preserve ^
   --temp 0.6 ^
   --top-p 0.95 ^
