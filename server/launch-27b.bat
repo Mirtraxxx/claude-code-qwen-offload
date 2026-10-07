@@ -25,6 +25,7 @@ echo   - Target:     Swift-1.5-Qwen3.8-27B-Uncensored-EXL3-3.75bpw (14.52 GiB, 5
 echo   - Drafter:    Qwen3.8-27B-DFlash2-EXL3-5.0bpw (1.47 GB)
 echo   - Context:    163,840 tokens (-cs 163840, 4,4-bit Hadamard KV Cache)
 echo   - Batching:   2 concurrent requests (-ambs 2)
+echo   - Load chunk: 512 tokens (-chunk_size 512, same as the server's prompt chunk, so warmup doesn't size buffers for 4096)
 echo   - Web Chat:   http://127.0.0.1:%PORT%/
 echo   - API:        http://127.0.0.1:%PORT%/v1
 echo   - Host:       %HOST%
@@ -37,6 +38,7 @@ echo.
   -cs 163840 ^
   -cq 4,4 ^
   -ambs 2 ^
+  -chunk_size 512 ^
   --mode thinking ^
   --reasoning-effort xhigh ^
   --reasoning-budget 0 ^

@@ -602,6 +602,45 @@ async def get_slots():
     ]
 
 
+# Live view of the requests the console panel shows (for the Claude Code Qwen panel): one row per running or
+# queued request, with its worker letter and, when qwen-run.mjs started it, the job label from its brief.
+_JOB_TAG = re.compile(r"\[qwen-job: ([^\]\n]{1,120})\]")
+
+
+def _job_label(messages) -> str | None:
+    for msg in messages or []:
+        if msg.get("role") == "user":
+            c = msg.get("content") or ""
+            m = _JOB_TAG.search(c if isinstance(c, str) else json.dumps(c, default=str)[:20000])
+            return m.group(1).strip() if m else None
+    return None
+
+
+@app.get("/v1/live")
+async def get_live():
+    now = time.time()
+    rows = []
+    with cv._LC_LOCK:
+        entries = list(cv._LIVE.values())
+    for c in entries:
+        w = getattr(c, "worker", None) or {}
+        row = {"task": c.task, "worker": w.get("name", "-"), "job": w.get("job"),
+               "seconds": round(now - c.t0, 1)}
+        if isinstance(c, cv.Waiting):
+            row["phase"] = "queued"
+        elif c.t_dec0 is None:
+            cache = c.n_cache or 0
+            fresh = max(1, c.n_prompt - cache)
+            done = min(fresh, max(0, c.pos - cache)) if c.pos is not None and c.n_cache is not None else 0
+            row.update(phase="reading", prompt=fresh, done=done, rate=round(c.pp_rate or 0.0, 1))
+        else:
+            dec = now - c.t_dec0
+            row.update(phase="writing", tokens=c.n_gen, rate=round(c.n_gen / dec, 1) if dec > 0 else 0.0)
+        rows.append(row)
+    rows.sort(key=lambda r: r["task"])
+    return {"slots": max(1, int(STATE["batch"].slots)), "requests": rows}
+
+
 @app.post("/v1/streams/lookup")
 async def streams_lookup():
     return []
@@ -745,6 +784,8 @@ async def chat_completions(request: Request):
     req_id = _next_req_id()
     req_note = _snippet(cleaned_messages)
     worker = _worker_for(cleaned_messages)
+    if "job" not in worker:
+        worker["job"] = _job_label(cleaned_messages)
     batch: BatchPump = STATE["batch"]
 
     if not stream:
@@ -1224,6 +1265,7 @@ class QuietPollingFilter(logging.Filter):
         "GET /health",
         "GET /v1/models",
         "GET /models",
+        "GET /v1/live",         # the Claude Code band's worker view
         "POST /v1/streams/lookup",
         "GET /_app/",
         "GET /favicon",
@@ -1237,6 +1279,10 @@ class QuietPollingFilter(logging.Filter):
         "GET /tools",           # the web UI probing for features this server doesn't have (404/405)
         "POST /tools",
         "GET /build.json",
+        "GET /metrics",         # other apps probing for features this server doesn't have (404/405)
+        "POST /v1/vram",
+        "GET /api/tags",        # Ollama-style model list
+        "GET /api/v1/models",   # LM Studio-style model list
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -1377,10 +1423,20 @@ def main():
         try:
             print(" -- Loading 6-bit Vision Tower...")
             vision_model = Model.from_config(config, component="vision")
-            vision_model.load(progressbar=True)
+            # Straight to cuda:0: the autosplit path's 0.5 GB reserve + dummy forward made it
+            # fail with ~1.8 GB free, and a failed autosplit leaves a per-process VRAM cap behind
+            vision_model.load(device="cuda:0", progressbar=True)
             STATE["vision_model"] = vision_model
         except Exception as e:
             print(f" [!] Vision tower skipped: {e}")
+        finally:
+            # Lift any VRAM cap a failed load left set (it caused "N GiB allowed" OOMs mid-generation)
+            for _d in range(torch.cuda.device_count()):
+                torch.cuda.set_per_process_memory_fraction(1.0, device=_d)
+
+    # Hand back the warmup's cached-but-unused blocks (~4 GB). Without this the process keeps
+    # ~23.7 GB reserved and the driver spills into system RAM (Qwen crawls at ~12 tok/s)
+    torch.cuda.empty_cache()
 
     hf_tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
 
@@ -1435,6 +1491,18 @@ def main():
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{browser_host}:{args.port}/")).start()
 
     _keep_accepting_on_windows()
+
+    # Clients that hang up (other local apps, browsers) make Windows' asyncio print a ConnectionResetError
+    # traceback per request; harmless, so keep them out of the console
+    @app.on_event("startup")
+    async def _quiet_client_resets():
+        loop = asyncio.get_running_loop()
+        def handler(lp, ctx):
+            if isinstance(ctx.get("exception"), (ConnectionResetError, ConnectionAbortedError)):
+                return
+            lp.default_exception_handler(ctx)
+        loop.set_exception_handler(handler)
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

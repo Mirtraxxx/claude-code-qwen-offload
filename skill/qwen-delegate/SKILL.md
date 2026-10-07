@@ -88,6 +88,7 @@ Done: beats the target, ratchet updated with tools/check.sh --update, losing var
   - A handoff is an LLM call and takes 1-3 min at `low`.
 - The server (`exl3_openai_server.py`):
   - `--effort-budgets low=4096,medium=8192,xhigh=16384` caps thinking per requested effort: at the cap the server injects "... reasoning budget reached, finalize response now." + </think> and the model must answer (logged THINK-CAP-HIT). The 27B launcher runs `-cs 163840` (2.2 GB VRAM still free after it on a 24 GB card).
+  - The 27B launcher also passes `-chunk_size 512` (since 2026-10-07), matching the server's 512-token prompt chunks. The loader defaults to 4096, so its load and warmup sized scratch buffers for prompt chunks the server never uses. That is the likely reason startup sat with VRAM nearly full for over a minute. If a 27B startup sits with VRAM nearly full, check that flag first.
   - `--max-chunk-size 512` keeps one worker's prompt reading from stalling the other to ~3 tok/s.
   - Its console (`console_view.py`) pins a live panel at the bottom (one row per running or queued request, with pp and t/s) and leaves one line per finished request above it; `CONSOLE_STYLE=lines` brings back the old scrolling lines.
   - It aborts a job when its client disconnects.
